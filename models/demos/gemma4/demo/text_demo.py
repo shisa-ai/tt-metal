@@ -45,7 +45,7 @@ from loguru import logger
 import ttnn
 from models.demos.gemma4.tests.test_factory import PREFILL_BUCKETS, parametrize_mesh_with_fabric
 from models.demos.gemma4.tt.common import create_tt_model
-from models.demos.gemma4.tt.generator import GEMMA4_MAX_BATCHED_PREFILL_SEQ_LEN, Gemma4Generator
+from models.demos.gemma4.tt.generator import GEMMA4_MAX_BATCHED_PREFILL_SEQ_LEN, Gemma4Generator, _load_text_tokenizer
 from models.demos.gemma4.tt.generator_trace import (
     should_auto_enable_bounded_sliding,
     should_auto_enable_chunked_bounded,
@@ -713,8 +713,6 @@ def run_generation(
     Returns:
         List of generated text strings
     """
-    from transformers import AutoTokenizer
-
     max_new_tokens = int(os.environ.get("GEMMA4_MAX_NEW_TOKENS", max_new_tokens))
     max_seq_len = int(os.environ.get("GEMMA4_MAX_SEQ_LEN", max_seq_len))
     _layers_env = os.environ.get("GEMMA4_NUM_LAYERS")
@@ -753,7 +751,8 @@ def run_generation(
 
     # Load tokenizer
     profiler.start("loading_inputs")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = _load_text_tokenizer(model_path)
+    stop_tokens = set(tokenizer.stop_tokens)
     logger.info(f"Tokenizer loaded from {model_path}")
     profiler.end("loading_inputs")
 
@@ -807,6 +806,8 @@ def run_generation(
     )
 
     generated_texts = []
+    generated_token_counts = []
+    prompt_lengths = []
 
     for prompt_idx, prompt in enumerate(prompts):
         logger.info(f"\n{'='*60}")
@@ -834,6 +835,7 @@ def run_generation(
         if prompt_len > padded_len:
             input_ids = input_ids[:padded_len]
             prompt_len = padded_len
+        prompt_lengths.append(prompt_len)
         input_ids_padded = torch.nn.functional.pad(input_ids, (0, padded_len - prompt_len), value=0)
         logger.info(f"Prompt tokens: {prompt_len} (padded to {padded_len})")
 
@@ -1055,7 +1057,7 @@ def run_generation(
 
         try:
             # ── Main decode loop (mode-agnostic) ──────────────────────────────
-            for step in range(max_new_tokens - 1):
+            while len(generated_tokens) < max_new_tokens and next_token not in stop_tokens:
                 if iteration == 0:
                     profiler.start(f"compile_decode", iteration=prompt_idx)
                 else:
@@ -1087,6 +1089,8 @@ def run_generation(
                         f"{1/decode_iteration_time:.1f} tok/s/user"
                     )
                     iteration += 1
+                    if next_token in stop_tokens or len(generated_tokens) >= max_new_tokens:
+                        break
 
                     # 2. Capture trace with fresh device buffers
                     logger.info("Capturing decode trace...")
@@ -1097,13 +1101,7 @@ def run_generation(
                     trace_output, _ = _fwd(trace_device_inputs)
                     ttnn.end_trace_capture(mesh_device, trace_id, cq_id=0)
                     logger.info("Decode trace captured")
-
-                    # 3. Execute trace for current iteration
-                    profiler.start(f"inference_decode_time_{iteration}", iteration=prompt_idx)
-                    _copy_inputs_to_trace(inputs_h2)
-                    ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False)
-                    decode_logits = trace_output
-                    t_enq_end = time.perf_counter()
+                    continue
 
                 else:
                     # ── No tracing: straightforward forward ──
@@ -1137,10 +1135,6 @@ def run_generation(
 
                 iteration += 1
 
-                # Check for EOS
-                if next_token == tokenizer.eos_token_id:
-                    break
-
         finally:
             if gc_was_enabled:
                 gc.enable()
@@ -1148,6 +1142,7 @@ def run_generation(
                 ttnn.release_trace(mesh_device, trace_id)
 
         profiler.end(f"inference_decode", iteration=prompt_idx)
+        generated_token_counts.append(len(generated_tokens))
 
         # Final output
         generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
@@ -1158,7 +1153,13 @@ def run_generation(
             f"\n==PROMPT {prompt_idx}\n{_shorten_for_log(prompt)}\n==OUTPUT {prompt_idx}\n{generated_text.strip()}\n"
         )
 
-    num_tokens_generated_decode = iteration  # from last prompt
+    # Performance metrics below describe prompt 0. This preserves the demo's
+    # existing single-prompt contract while allowing correctness callers to
+    # pass mixed-length prompt lists without indexing missing profiler steps.
+    num_tokens_generated_decode = generated_token_counts[0]
+    num_decode_iterations = max(num_tokens_generated_decode - 1, 0)
+    num_steady_decode_tokens = max(num_decode_iterations - 1, 0)
+    prompt_len = prompt_lengths[0]
 
     profiler.end("run")
 
@@ -1166,22 +1167,22 @@ def run_generation(
     # compile_prefill = first (warmup) prefill call, includes kernel compile.
     # inference_prefill = second prefill call, kernels already cached — drives TTFT.
     compile_prefill_time = profiler.get_duration("compile_prefill")
-    compile_decode_time = profiler.get_duration("compile_decode")
+    compile_decode_time = profiler.get_duration("compile_decode") if profiler.contains_step("compile_decode") else 0
     total_inference_prefill_time = profiler.get_duration("inference_prefill")
 
     total_inference_decode_time = 0
-    for i in range(1, num_tokens_generated_decode):  # Iteration 0 is the compile time
+    for i in range(1, num_decode_iterations):  # Iteration 0 is the compile time
         total_inference_decode_time += profiler.get_duration(f"inference_decode_time_{i}")
 
     avg_time_to_first_token = total_inference_prefill_time / batch_size
     avg_decode_iteration_time = (
-        total_inference_decode_time / (num_tokens_generated_decode - 1) if num_tokens_generated_decode > 1 else 0
+        total_inference_decode_time / num_steady_decode_tokens if num_steady_decode_tokens > 0 else 0
     )
 
     prefill_tok_s = prompt_len / total_inference_prefill_time * batch_size if total_inference_prefill_time > 0 else 0
     decode_tok_s_user = (
-        (num_tokens_generated_decode - 1) / total_inference_decode_time
-        if num_tokens_generated_decode > 1 and total_inference_decode_time > 0
+        num_steady_decode_tokens / total_inference_decode_time
+        if num_steady_decode_tokens > 0 and total_inference_decode_time > 0
         else 0
     )
     decode_tok_s = decode_tok_s_user * batch_size
@@ -1189,7 +1190,6 @@ def run_generation(
     measurements = {
         # Required measurements
         "compile_prefill": compile_prefill_time,
-        "compile_decode": compile_decode_time,
         "inference_prefill": total_inference_prefill_time,
         "inference_decode": total_inference_decode_time,
         "prefill_time_to_token": avg_time_to_first_token,
@@ -1200,10 +1200,12 @@ def run_generation(
         "Total compile time": compile_prefill_time + compile_decode_time,
         "Full demo runtime": profiler.get_duration("run"),
     }
+    if profiler.contains_step("compile_decode"):
+        measurements["compile_decode"] = compile_decode_time
 
     # Decode performance at specific token milestones
-    tok_1_perf = profiler.get_duration("inference_decode_time_1") if 1 < num_tokens_generated_decode else 0
-    tok_128_perf = profiler.get_duration("inference_decode_time_127") if 127 < num_tokens_generated_decode else 0
+    tok_1_perf = profiler.get_duration("inference_decode_time_1") if 1 < num_decode_iterations else 0
+    tok_128_perf = profiler.get_duration("inference_decode_time_127") if 127 < num_decode_iterations else 0
 
     logger.info("")
     logger.info("=== Performance metrics ===")
@@ -1236,7 +1238,7 @@ def run_generation(
         benchmark_data = create_benchmark_data(profiler, measurements, bench_n_warmup_iter, targets)
 
         # Save the decode performance of every iteration for plotting
-        for i in range(1, num_tokens_generated_decode):
+        for i in range(1, num_decode_iterations):
             benchmark_data.add_measurement(
                 profiler,
                 0,
@@ -1248,7 +1250,7 @@ def run_generation(
             )
 
         # Average decode performance for first 128 iterations (excluding compile)
-        num_iterations_for_avg = min(128, num_tokens_generated_decode)
+        num_iterations_for_avg = min(128, num_decode_iterations)
         inference_decode_time_first_128 = sum(
             profiler.get_duration(f"inference_decode_time_{i}") for i in range(1, num_iterations_for_avg)
         )

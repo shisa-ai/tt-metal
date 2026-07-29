@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 from loguru import logger
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig
 
 from models.demos.gemma4.tt.common import create_tt_model
 from models.demos.gemma4.tt.generator_trace import (
@@ -32,7 +32,7 @@ def _load_text_tokenizer(model_path):
     # a list (for example ["<|video|>"]), while this transformers version expects
     # a dict. The text-only demo does not need those model-specific aliases.
     try:
-        return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, extra_special_tokens={})
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, extra_special_tokens={})
     except (ValueError, OSError, EnvironmentError) as e:
         # The whole Gemma4 family shares one identical tokenizer, but some
         # checkpoints (e.g. gemma-4-31B-it) ship without local tokenizer files.
@@ -47,7 +47,25 @@ def _load_text_tokenizer(model_path):
             f"falling back to the shared Gemma4 tokenizer '{fallback}'. "
             f"Override with GEMMA4_TOKENIZER."
         )
-        return AutoTokenizer.from_pretrained(fallback, trust_remote_code=True, extra_special_tokens={})
+        tokenizer = AutoTokenizer.from_pretrained(fallback, trust_remote_code=True, extra_special_tokens={})
+
+    try:
+        generation_config = GenerationConfig.from_pretrained(model_path)
+        eos_token_ids = generation_config.eos_token_id
+    except (ValueError, OSError, EnvironmentError) as e:
+        logger.warning(
+            f"Generation config load from '{model_path}' failed ({type(e).__name__}: {e}); "
+            "falling back to tokenizer.eos_token_id."
+        )
+        eos_token_ids = tokenizer.eos_token_id
+
+    if isinstance(eos_token_ids, int):
+        eos_token_ids = [eos_token_ids]
+    tokenizer.stop_tokens = list(dict.fromkeys(token_id for token_id in (eos_token_ids or []) if token_id is not None))
+    if not tokenizer.stop_tokens and tokenizer.eos_token_id is not None:
+        tokenizer.stop_tokens = [tokenizer.eos_token_id]
+    logger.info(f"Gemma4 stop token IDs: {tokenizer.stop_tokens}")
+    return tokenizer
 
 
 def _trace_prefill_supported_seq_lens(max_seq_len, has_per_layer_inputs, bounded_sliding=False):
