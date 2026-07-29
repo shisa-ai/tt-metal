@@ -45,6 +45,7 @@
 #include <umd/device/types/arch.hpp>
 #include <tt-metalium/distributed.hpp>
 #include <tt-metalium/mesh_buffer.hpp>
+#include <tt-metalium/tensor_accessor_args.hpp>
 
 using namespace tt;
 using std::chrono::duration_cast;
@@ -81,7 +82,8 @@ std::tuple<tt_metal::Program, tt_metal::KernelHandle, uint32_t> create_program(
     const uint32_t& num_reqs_at_a_time,
     const uint32_t& single_tile_size,
     const tt::DataFormat& tile_format,
-    const uint32_t& access_type);
+    const uint32_t& access_type,
+    const std::shared_ptr<tt_metal::distributed::MeshBuffer>& input_buffer);
 
 bool assign_runtime_args_to_program(
     tt_metal::Program& program,
@@ -222,8 +224,8 @@ int main(int argc, char** argv) {
         //                      Application Setup
         ////////////////////////////////////////////////////////////////////////////
         uint32_t num_reqs_at_a_time = 1;
-        auto [program, kernel, cb_addr] =
-            create_program(device.get(), all_cores, num_reqs_at_a_time, single_tile_size, tile_format, access_type);
+        auto [program, kernel, cb_addr] = create_program(
+            device.get(), all_cores, num_reqs_at_a_time, single_tile_size, tile_format, access_type, input_buffer);
         pass &= assign_runtime_args_to_program(
             program,
             num_cores,
@@ -394,7 +396,8 @@ std::tuple<tt_metal::Program, tt_metal::KernelHandle, uint32_t> create_program(
     const uint32_t& num_reqs_at_a_time,
     const uint32_t& single_tile_size,
     const tt::DataFormat& tile_format,
-    const uint32_t& access_type) {
+    const uint32_t& access_type,
+    const std::shared_ptr<tt_metal::distributed::MeshBuffer>& input_buffer) {
     tt_metal::Program program = tt_metal::Program();
 
     uint32_t cb_index = 0;
@@ -404,6 +407,9 @@ std::tuple<tt_metal::Program, tt_metal::KernelHandle, uint32_t> create_program(
         tt_metal::CircularBufferConfig(cb_tiles * single_tile_size, {{cb_index, tile_format}})
             .set_page_size(cb_index, single_tile_size);
     tt_metal::CreateCircularBuffer(program, all_cores, cb_config);
+
+    std::vector<uint32_t> compile_time_args;
+    tt_metal::TensorAccessorArgs(input_buffer).append_to(compile_time_args);
 
     auto reader_kernel = tt_metal::CreateKernel(
         program,
@@ -415,7 +421,8 @@ std::tuple<tt_metal::Program, tt_metal::KernelHandle, uint32_t> create_program(
         tt_metal::DataMovementConfig{
             .processor = (access_type == 0) ? tt_metal::DataMovementProcessor::RISCV_1
                                             : tt_metal::DataMovementProcessor::RISCV_0,
-            .noc = (access_type == 0) ? tt_metal::NOC::RISCV_1_default : tt_metal::NOC::RISCV_0_default});
+            .noc = (access_type == 0) ? tt_metal::NOC::RISCV_1_default : tt_metal::NOC::RISCV_0_default,
+            .compile_args = compile_time_args});
     return {std::move(program), reader_kernel, cb_addr};
 }
 
