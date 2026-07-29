@@ -508,6 +508,19 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
     hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     hf_model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    log_layer_pcc = os.getenv("GEMMA4_LOG_LAYER_PCC") == "1"
+    hf_layer_outputs = {}
+    hf_layer_hooks = []
+    if log_layer_pcc:
+        hf_text_model = hf_model.model.language_model if hasattr(hf_model.model, "language_model") else hf_model.model
+        for layer_idx, layer in enumerate(hf_text_model.layers):
+            hf_layer_hooks.append(
+                layer.register_forward_hook(
+                    lambda _module, _inputs, output, layer_idx=layer_idx: hf_layer_outputs.__setitem__(
+                        layer_idx, output.detach().float().cpu()
+                    )
+                )
+            )
 
     prompt = "The capital of France is"
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
@@ -517,6 +530,8 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
         next_tok = int(hf_out.logits[0, -1].argmax().item())  # teacher-forced decode input
         hf_dec = hf_model(torch.tensor([[next_tok]]), past_key_values=hf_out.past_key_values, use_cache=True)
         hf_decode_logits = hf_dec.logits[0, -1].float()  # [vocab]
+    for hook in hf_layer_hooks:
+        hook.remove()
     logger.info(f"HF prefill next token: {next_tok} ('{tokenizer.decode([next_tok])}'), decoding at pos={seq_len}")
     del hf_model
     gc.collect()
@@ -525,7 +540,7 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
     padded_len = ((seq_len + 31) // 32) * 32
     input_ids_padded = F.pad(input_ids, (0, padded_len - seq_len), value=0) if padded_len > seq_len else input_ids
 
-    model_args, tt_model, tt_kv_cache, _ = create_tt_model(
+    model_args, tt_model, tt_kv_cache, state_dict = create_tt_model(
         mesh_device=mesh_device,
         max_batch_size=1,
         max_seq_len=max(padded_len, 128),
@@ -545,23 +560,55 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
     embeds = ttnn.to_layout(
         ttnn.reshape(tt_model.embed_tokens(tokens_tt), (1, 1, padded_len, model_args.hidden_size)), ttnn.TILE_LAYOUT
     )
+    embeds_torch = (
+        F.embedding(
+            input_ids_padded.long(),
+            state_dict.get(
+                "model.language_model.embed_tokens.weight",
+                state_dict.get("model.embed_tokens.weight", torch.zeros(1)),
+            ),
+        )
+        * tt_model.embed_scale
+    ).float()
     tt_model.ttnn_prefill_forward(
         embeds,
         page_table=None,
         kv_cache=tt_kv_cache,
         input_ids_torch=input_ids_padded,
-        embeds_torch=None,
+        embeds_torch=embeds_torch,
     ).deallocate(True)
 
     # One decode step at position seq_len with the teacher-forced token.
     device_inputs = tt_model.prepare_inputs_decode(torch.tensor([next_tok]), torch.tensor([seq_len]), page_table=None)
-    logits, _ = tt_model.ttnn_decode_forward(
-        x=device_inputs[0],
-        current_pos=device_inputs[1],
-        rot_mat_idxs=device_inputs[2],
-        page_table=device_inputs[3],
-        kv_cache=tt_kv_cache,
-    )
+
+    def _decode_once():
+        return tt_model.ttnn_decode_forward(
+            x=device_inputs[0],
+            current_pos=device_inputs[1],
+            rot_mat_idxs=device_inputs[2],
+            page_table=device_inputs[3],
+            kv_cache=tt_kv_cache,
+        )
+
+    tt_layer_outputs = {}
+    if log_layer_pcc:
+        from unittest.mock import patch
+
+        from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
+
+        original_layer_call = Gemma4DecoderLayer.__call__
+
+        def _capturing_layer_call(layer, *args, **kwargs):
+            output = original_layer_call(layer, *args, **kwargs)
+            device_tensors = ttnn.get_device_tensors(output)
+            output_device = device_tensors[0] if device_tensors else output
+            tt_layer_outputs[layer.layer_idx] = ttnn.to_torch(output_device).float()
+            return output
+
+        with patch.object(Gemma4DecoderLayer, "__call__", _capturing_layer_call):
+            logits, _ = _decode_once()
+    else:
+        logits, _ = _decode_once()
     if is_mesh and tp > 1:
         shards = [ttnn.to_torch(t).float() for t in ttnn.get_device_tensors(logits)]
         tt_decode_logits = shards[0] if shards[0].shape[-1] >= model_args.vocab_size else torch.cat(shards, dim=-1)
@@ -577,6 +624,12 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
         f"Decode argmax: HF={hf_argmax} ('{tokenizer.decode([hf_argmax])}'), "
         f"TT={tt_argmax} ('{tokenizer.decode([tt_argmax])}')"
     )
+    if log_layer_pcc:
+        for layer_idx in range(len(tt_model.layers)):
+            hf_hidden = hf_layer_outputs[layer_idx].reshape(-1, model_args.hidden_size)[-1]
+            tt_hidden = tt_layer_outputs[layer_idx].reshape(-1, model_args.hidden_size)[0]
+            _, layer_pcc = compare_tensors(tt_hidden, hf_hidden, pcc_threshold=0.0)
+            logger.info(f"Decode layer[{layer_idx:02d}] PCC: {layer_pcc}")
     assert passing, f"Full model decode PCC too low: {pcc_msg}"
 
 
