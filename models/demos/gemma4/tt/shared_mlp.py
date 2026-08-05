@@ -16,6 +16,7 @@ HF weight shapes:
 
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
+from models.demos.gemma4.tt.precision import dtype_to_str
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 
@@ -44,8 +45,7 @@ class SharedMLP:
         # doesn't collide with a previously-cached file that holds the same
         # logical weight at a different dtype. The rest of the model's cache
         # entries are unaffected and stay reusable across runs.
-        _dtype_str = {ttnn.bfloat16: "bf16", ttnn.bfloat8_b: "bfp8"}[dtype]
-        dtype_suffix = f"_{_dtype_str}"
+        dtype_suffix = f"_{dtype_to_str(dtype)}"
 
         if tp > 1:
             col_mapper = mesh_config.column_parallel(mesh_device)
