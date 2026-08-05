@@ -952,10 +952,11 @@ class Gemma4Model:
         # >= 4k OOMs DRAM on smaller WH SKUs (lm_head logits = seq_len * vocab
         # * 2B; at seq=4096 that's 2 GiB, doesn't fit in DRAM with weights).
         if get_last_token != -1:
+            lm_head_tile_start = (int(get_last_token) // 32) * 32
             hidden_states = ttnn.slice(
                 hidden_states,
-                (0, 0, get_last_token, 0),
-                (1, 1, get_last_token + 32, hidden_states.shape[-1]),
+                (0, 0, lm_head_tile_start, 0),
+                (1, 1, lm_head_tile_start + 32, hidden_states.shape[-1]),
             )
 
         return self._apply_lm_head(hidden_states, is_decode=is_decode)

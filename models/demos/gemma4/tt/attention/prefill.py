@@ -193,6 +193,23 @@ def _prefill_forward_single(
                 if 0 < fill_len < tt_k.shape[-2]:
                     k_fill = ttnn.slice(tt_k, [0, 0, 0, 0], [tt_k.shape[0], tt_k.shape[1], fill_len, tt_k.shape[3]])
                     v_fill = ttnn.slice(tt_v, [0, 0, 0, 0], [tt_v.shape[0], tt_v.shape[1], fill_len, tt_v.shape[3]])
+            elif valid_seq_len is not None:
+                # Unbounded paged KV still must not consume the power-of-two
+                # padding rows. Their zero page-table columns otherwise write
+                # repeatedly through physical block 0. Keep a legal tile height
+                # while excluding every complete padding tile.
+                fill_len = ((min(valid_seq_len, tt_k.shape[-2]) + TILE_HEIGHT - 1) // TILE_HEIGHT) * TILE_HEIGHT
+                if 0 < fill_len < tt_k.shape[-2]:
+                    k_fill = ttnn.slice(
+                        tt_k,
+                        [0, 0, 0, 0],
+                        [tt_k.shape[0], tt_k.shape[1], fill_len, tt_k.shape[3]],
+                    )
+                    v_fill = ttnn.slice(
+                        tt_v,
+                        [0, 0, 0, 0],
+                        [tt_v.shape[0], tt_v.shape[1], fill_len, tt_v.shape[3]],
+                    )
             ttnn.experimental.paged_fill_cache(
                 k_cache,
                 k_fill,

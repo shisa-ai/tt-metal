@@ -1092,6 +1092,15 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         del is_last_chunk, chunk_size
         return (last_token_idx_in_chunk // 32) * 32
 
+    def _prefill_get_last_token(self, last_token_idx):
+        """Last-token index passed to a single-chunk model prefill.
+
+        Most models retain the legacy tile-aligned value. Models that use the
+        value as a real KV-fill length can override this hook and align only
+        the later LM-head extraction.
+        """
+        return (int(last_token_idx) // 32) * 32
+
     def _chunk_prefill_page_table(self, page_table, *, user_id, model_id=-1, kv_cache=None):
         """Page table + block_size for multi-chunk ``chunk_page_table`` slices.
 
@@ -1248,7 +1257,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 rot_mats_local=rot_mats_local_prefill,
                 user_id=user_id,
                 page_table=page_table_tt,
-                get_last_token=-1 if batch_size > 1 else (last_token_idx // 32) * 32,
+                get_last_token=-1 if batch_size > 1 else self._prefill_get_last_token(last_token_idx),
                 kv_cache=kv_cache,
                 batch_size=batch_size,
             )

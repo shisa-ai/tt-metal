@@ -212,6 +212,14 @@ class ChunkedPrefillPageTableGuardMixin:
         # it matches the HMA effective block_size instead of the declared shape.
         return self._effective_paged_block_size(kv_cache)
 
+    def _prefill_get_last_token(self, last_token_idx):
+        """Pass the real index so padded prefill cannot extend the KV fill.
+
+        Gemma4 uses ``get_last_token + 1`` as the valid KV length. The model
+        tile-aligns LM-head extraction independently.
+        """
+        return int(last_token_idx)
+
     def _chunk_prefill_get_last_token(self, *, is_last_chunk, last_token_idx_in_chunk, chunk_size):
         """Per-chunk fill length for Gemma4 multi-chunk prefill.
 
@@ -221,11 +229,12 @@ class ChunkedPrefillPageTableGuardMixin:
         bounded-sliding attention. Return ``-1`` for intermediate chunks so:
           * ``valid_seq_len`` stays unset → the whole chunk is written to KV
           * the model skips the last-token lm_head slice (logits are discarded)
-        Keep the real (tile-aligned) index on the last chunk.
+        Keep the real index on the last chunk; the model tile-aligns only the
+        LM-head extraction.
         """
         del chunk_size
         if is_last_chunk:
-            return (last_token_idx_in_chunk // 32) * 32
+            return int(last_token_idx_in_chunk)
         return -1
 
     def _refresh_prefill_valid_seq_len(self, *, model_id=-1, last_token_idx=None, num_cached_tokens=0):
