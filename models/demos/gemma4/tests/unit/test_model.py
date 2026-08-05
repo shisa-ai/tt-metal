@@ -13,7 +13,7 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.gemma4.tt.model import Gemma4Model
+from models.demos.gemma4.tt.model import Gemma4Model, _scaled_host_embeddings
 from models.demos.gemma4.tt.model_config import Gemma4ModelArgs
 
 from ...tests.test_factory import (
@@ -91,6 +91,20 @@ def test_softcapping(reset_seeds):
     small = torch.randn(1, 1, 32, 100) * 0.1
     small_capped = torch.tanh(small / cap) * cap
     assert torch.allclose(small_capped, small, atol=1e-3)
+
+
+def test_scaled_host_embeddings_match_bf16_device_precision_order():
+    embedding_weight = torch.tensor([[0.12345, -2.345, 7.891], [-1.2345, 3.456, -6.789]], dtype=torch.bfloat16)
+    input_ids = torch.tensor([[0, 1]], dtype=torch.long)
+    embed_scale = 1536**0.5
+
+    actual = _scaled_host_embeddings(input_ids, embedding_weight, embed_scale)
+    expected = (torch.nn.functional.embedding(input_ids, embedding_weight) * embed_scale).float()
+    promoted_before_scale = torch.nn.functional.embedding(input_ids, embedding_weight).float() * embed_scale
+
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, promoted_before_scale)
 
 
 # ── HF Reference Helpers ──────────────────────────────────────────────────
@@ -1125,9 +1139,7 @@ def test_single_prefill_perf(mesh_device, reset_seeds, request):
     # Host stashes for PLI models (no-op for 31B/12B, which have no per-layer inputs).
     model._prefill_input_ids_torch = tokens.long()
     if model._embed_weight_cpu is not None:
-        import torch.nn.functional as F
-
-        model._prefill_embeds_torch = F.embedding(tokens.long(), model._embed_weight_cpu).float() * model.embed_scale
+        model._prefill_embeds_torch = _scaled_host_embeddings(tokens.long(), model._embed_weight_cpu, model.embed_scale)
     else:
         model._prefill_embeds_torch = None
 

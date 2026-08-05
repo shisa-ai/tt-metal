@@ -175,7 +175,7 @@ def _run_direct_model_prefill_last_logit(generator, tokens, prompt_lens):
         embeds = ttnn.to_layout(embeds, ttnn.TILE_LAYOUT)
         embeds_torch = None
         if model._embed_weight_cpu is not None:
-            embeds_torch = F.embedding(tokens_slice.long(), model._embed_weight_cpu).float() * model.embed_scale
+            embeds_torch = (F.embedding(tokens_slice.long(), model._embed_weight_cpu) * model.embed_scale).float()
 
         last_token_idx = prompt_len - 1
         tt_logits = model.ttnn_prefill_forward(

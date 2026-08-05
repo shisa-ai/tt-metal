@@ -38,6 +38,13 @@ from models.demos.gemma4.utils.substate import substate
 LM_HEAD_SIGNPOST = "gemma4_lm_head"
 
 
+def _scaled_host_embeddings(input_ids, embedding_weight, embed_scale):
+    """Match the BF16 embedding-scale order used by the device path."""
+    import torch.nn.functional as F
+
+    return (F.embedding(input_ids, embedding_weight) * embed_scale).float()
+
+
 def _compute_per_device_vocab(vocab_size, num_tp):
     """Per-device vocab width: tile-aligned then rounded to next power of 2.
 
@@ -1210,13 +1217,11 @@ class Gemma4Model:
         Returns:
             pli_combined: torch.Tensor [1, 1, n_layers, pli_size] bfloat16, or None
         """
-        import torch.nn.functional as F
-
         if not self.hidden_size_per_layer_input or not self.per_layer_input_weights:
             return None
 
         token_tensor = torch.tensor([[token_id]], dtype=torch.long)
-        embeds = F.embedding(token_tensor, self._embed_weight_cpu).float() * self.embed_scale
+        embeds = _scaled_host_embeddings(token_tensor, self._embed_weight_cpu, self.embed_scale)
         pli_list = self._compute_per_layer_inputs(token_tensor.int(), embeds)
         if pli_list is None:
             return None
@@ -1233,10 +1238,8 @@ class Gemma4Model:
             - embeds: torch.Tensor [1, 1, 1, hidden_size] bfloat16
             - pli_combined: torch.Tensor [1, 1, n_layers, pli_size] bfloat16, or None
         """
-        import torch.nn.functional as F
-
         token_tensor = torch.tensor([[token_id]], dtype=torch.long)
-        embeds = F.embedding(token_tensor, self._embed_weight_cpu).float() * self.embed_scale
+        embeds = _scaled_host_embeddings(token_tensor, self._embed_weight_cpu, self.embed_scale)
         pli_combined = self.compute_host_pli(token_id)
         embeds = embeds.reshape(1, 1, 1, self.hidden_size).to(torch.bfloat16)
         return embeds, pli_combined
@@ -1368,7 +1371,6 @@ class Gemma4Model:
         return so the generator's 6-element unpack at
         ``tt_transformers/tt/generator.py:1151`` lines up).
         """
-        import torch.nn.functional as F
 
         del start_pos, last_token_idx, global_user_id, user_id, batched_prefill, kwargs
         del chunk_start_idx  # Accepted for signature compat; Gemma4 doesn't chunk-prefill.
@@ -1419,7 +1421,7 @@ class Gemma4Model:
         self._prefill_batch_size = batch_size
         self._prefill_seq_len_per_user = per_user_seq_len
         if self._embed_weight_cpu is not None:
-            self._prefill_embeds_torch = F.embedding(tokens_torch, self._embed_weight_cpu).float() * self.embed_scale
+            self._prefill_embeds_torch = _scaled_host_embeddings(tokens_torch, self._embed_weight_cpu, self.embed_scale)
         else:
             self._prefill_embeds_torch = None
 
