@@ -350,6 +350,25 @@ def test_full_model(mesh_device, reset_seeds, request):
     hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     hf_model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    log_layer_pcc = os.getenv("GEMMA4_LOG_LAYER_PCC") == "1"
+    hf_layer_outputs = {}
+    hf_layer_inputs = {}
+    hf_pli_inputs = {}
+    hf_layer_hooks = []
+    if log_layer_pcc:
+        hf_text_model = hf_model.model.language_model if hasattr(hf_model.model, "language_model") else hf_model.model
+
+        def _capture_hf_layer(layer_idx):
+            def _hook(_module, inputs, output):
+                hf_layer_inputs[layer_idx] = inputs[0].detach().cpu()
+                if len(inputs) > 1 and inputs[1] is not None:
+                    hf_pli_inputs[layer_idx] = inputs[1].detach().cpu()
+                hf_layer_outputs[layer_idx] = output.detach().cpu()
+
+            return _hook
+
+        for layer_idx, layer in enumerate(hf_text_model.layers):
+            hf_layer_hooks.append(layer.register_forward_hook(_capture_hf_layer(layer_idx)))
 
     prompt = "The capital of France is"
     input_ids = tokenizer.encode(prompt, return_tensors="pt")  # [1, seq_len]
@@ -365,6 +384,8 @@ def test_full_model(mesh_device, reset_seeds, request):
     with torch.no_grad():
         hf_out = hf_model(input_ids_padded)
         hf_logits = hf_out.logits.float()  # [1, padded_len, vocab_size]
+    for hook in hf_layer_hooks:
+        hook.remove()
 
     # Note: HF Gemma4ForConditionalGeneration already applies softcapping internally,
     # so no need to apply it again here. TT model also applies it internally.
@@ -414,13 +435,34 @@ def test_full_model(mesh_device, reset_seeds, request):
         * tt_model.embed_scale
     ).float()
 
-    tt_logits = tt_model.ttnn_prefill_forward(
-        embeds,
-        page_table=None,
-        kv_cache=tt_kv_cache,
-        input_ids_torch=input_ids_padded,
-        embeds_torch=embeds_torch,
-    )
+    def _prefill_once():
+        return tt_model.ttnn_prefill_forward(
+            embeds,
+            page_table=None,
+            kv_cache=tt_kv_cache,
+            input_ids_torch=input_ids_padded,
+            embeds_torch=embeds_torch,
+        )
+
+    tt_layer_outputs = {}
+    if log_layer_pcc:
+        from unittest.mock import patch
+
+        from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
+
+        original_layer_call = Gemma4DecoderLayer.__call__
+
+        def _capturing_layer_call(layer, *args, **kwargs):
+            output = original_layer_call(layer, *args, **kwargs)
+            device_tensors = ttnn.get_device_tensors(output)
+            output_device = device_tensors[0] if device_tensors else output
+            tt_layer_outputs[layer.layer_idx] = ttnn.to_torch(output_device).float()
+            return output
+
+        with patch.object(Gemma4DecoderLayer, "__call__", _capturing_layer_call):
+            tt_logits = _prefill_once()
+    else:
+        tt_logits = _prefill_once()
 
     if is_mesh:
         tt_logits_torch = ttnn.to_torch(ttnn.get_device_tensors(tt_logits)[0]).float()
@@ -457,6 +499,59 @@ def test_full_model(mesh_device, reset_seeds, request):
         )
     _, pcc_last_only = comp_pcc(hf_compare[0, -1], tt_compare[0, -1], pcc=0.0)
     logger.info(f"Last-token-only PCC: {pcc_last_only:.6f}")
+
+    if log_layer_pcc:
+        for layer_idx in range(len(tt_model.layers)):
+            hf_hidden = hf_layer_outputs[layer_idx].reshape(-1, model_args.hidden_size)[:seq_len]
+            tt_hidden = tt_layer_outputs[layer_idx].reshape(-1, model_args.hidden_size)[:seq_len]
+            _, full_pcc = comp_pcc(hf_hidden, tt_hidden, pcc=0.0)
+            _, last_pcc = comp_pcc(hf_hidden[-1], tt_hidden[-1], pcc=0.0)
+            logger.info(f"Prefill layer[{layer_idx:02d}] PCC: full={full_pcc:.6f} last_token={last_pcc:.6f}")
+
+        # Re-run every non-KV-shared layer with the exact HF layer input and
+        # exact HF PLI tensor. This removes accumulated upstream drift and
+        # reports each layer's intrinsic TT-vs-HF fidelity. KV-shared layers
+        # need their source layer's K/V tensors and are intentionally left to
+        # the free-running trace above.
+        for layer_idx, layer in enumerate(tt_model.layers):
+            if layer_idx in tt_model.kv_shared_layer_map:
+                continue
+            hf_input = hf_layer_inputs[layer_idx].unsqueeze(1)
+            hf_pli = hf_pli_inputs.get(layer_idx)
+            input_tt = ttnn.from_torch(
+                hf_input,
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=replicate,
+            )
+            pli_tt = None
+            if hf_pli is not None:
+                pli_tt = ttnn.from_torch(
+                    hf_pli.unsqueeze(1),
+                    device=mesh_device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                    mesh_mapper=replicate,
+                )
+            intrinsic_tt = layer(
+                input_tt,
+                rope_mats=tt_model._get_rope_mats(layer_idx, seq_len=padded_len),
+                position_idx=None,
+                page_table=None,
+                kv_cache=tt_kv_cache[layer_idx],
+                is_decode=False,
+                per_layer_input=pli_tt,
+            )
+            intrinsic_device = ttnn.get_device_tensors(intrinsic_tt)[0]
+            intrinsic_hidden = ttnn.to_torch(intrinsic_device).reshape(-1, model_args.hidden_size)[:seq_len]
+            hf_hidden = hf_layer_outputs[layer_idx].reshape(-1, model_args.hidden_size)[:seq_len].float()
+            _, full_pcc = comp_pcc(hf_hidden, intrinsic_hidden, pcc=0.0)
+            _, last_pcc = comp_pcc(hf_hidden[-1], intrinsic_hidden[-1], pcc=0.0)
+            logger.info(f"Intrinsic prefill layer[{layer_idx:02d}] PCC: full={full_pcc:.6f} last_token={last_pcc:.6f}")
+            intrinsic_tt.deallocate(True)
+            if pli_tt is not None:
+                pli_tt.deallocate(True)
 
     # Also check that argmax tokens match for the last position
     hf_last_tok = hf_compare[0, -1, :].argmax().item()
