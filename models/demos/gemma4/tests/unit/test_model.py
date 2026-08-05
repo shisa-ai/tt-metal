@@ -354,6 +354,7 @@ def test_full_model(mesh_device, reset_seeds, request):
     hf_layer_outputs = {}
     hf_layer_inputs = {}
     hf_pli_inputs = {}
+    hf_final_norm_output = {}
     hf_layer_hooks = []
     if log_layer_pcc:
         hf_text_model = hf_model.model.language_model if hasattr(hf_model.model, "language_model") else hf_model.model
@@ -369,6 +370,11 @@ def test_full_model(mesh_device, reset_seeds, request):
 
         for layer_idx, layer in enumerate(hf_text_model.layers):
             hf_layer_hooks.append(layer.register_forward_hook(_capture_hf_layer(layer_idx)))
+        hf_layer_hooks.append(
+            hf_text_model.norm.register_forward_hook(
+                lambda _module, _inputs, output: hf_final_norm_output.__setitem__("value", output.detach().cpu())
+            )
+        )
 
     prompt = "The capital of France is"
     input_ids = tokenizer.encode(prompt, return_tensors="pt")  # [1, seq_len]
@@ -553,6 +559,39 @@ def test_full_model(mesh_device, reset_seeds, request):
             if pli_tt is not None:
                 pli_tt.deallocate(True)
 
+        # Isolate the final norm and LM head from all decoder-layer drift.
+        final_norm_input_tt = ttnn.from_torch(
+            hf_layer_outputs[len(tt_model.layers) - 1].unsqueeze(1),
+            device=mesh_device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            mesh_mapper=replicate,
+        )
+        intrinsic_norm_tt = tt_model.norm.forward(final_norm_input_tt)
+        intrinsic_norm = ttnn.to_torch(ttnn.get_device_tensors(intrinsic_norm_tt)[0]).reshape(
+            -1, model_args.hidden_size
+        )[:seq_len]
+        hf_norm = hf_final_norm_output["value"].reshape(-1, model_args.hidden_size)[:seq_len].float()
+        _, norm_pcc = comp_pcc(hf_norm, intrinsic_norm, pcc=0.0)
+        logger.info(f"Intrinsic prefill final norm PCC: {norm_pcc:.6f}")
+        intrinsic_norm_tt.deallocate(True)
+
+        lm_head_input_tt = ttnn.from_torch(
+            hf_final_norm_output["value"].unsqueeze(1),
+            device=mesh_device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            mesh_mapper=replicate,
+        )
+        intrinsic_logits_tt = tt_model._apply_lm_head(lm_head_input_tt, is_decode=False)
+        intrinsic_logits = ttnn.to_torch(ttnn.get_device_tensors(intrinsic_logits_tt)[0]).reshape(
+            -1, model_args.vocab_size
+        )[:seq_len]
+        for token_idx in range(seq_len):
+            _, logits_pcc = comp_pcc(hf_compare[0, token_idx], intrinsic_logits[token_idx], pcc=0.0)
+            logger.info(f"Intrinsic prefill LM head token[{token_idx}] PCC: {logits_pcc:.6f}")
+        intrinsic_logits_tt.deallocate(True)
+
     # Also check that argmax tokens match for the last position
     hf_last_tok = hf_compare[0, -1, :].argmax().item()
     tt_last_tok = tt_compare[0, -1, :].argmax().item()
@@ -605,17 +644,29 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     log_layer_pcc = os.getenv("GEMMA4_LOG_LAYER_PCC") == "1"
     hf_layer_outputs = {}
+    hf_layer_inputs = {}
+    hf_pli_inputs = {}
+    hf_final_norm_output = {}
     hf_layer_hooks = []
     if log_layer_pcc:
         hf_text_model = hf_model.model.language_model if hasattr(hf_model.model, "language_model") else hf_model.model
+
+        def _capture_hf_layer(layer_idx):
+            def _hook(_module, inputs, output):
+                hf_layer_inputs[layer_idx] = inputs[0].detach().cpu()
+                if len(inputs) > 1 and inputs[1] is not None:
+                    hf_pli_inputs[layer_idx] = inputs[1].detach().cpu()
+                hf_layer_outputs[layer_idx] = output.detach().cpu()
+
+            return _hook
+
         for layer_idx, layer in enumerate(hf_text_model.layers):
-            hf_layer_hooks.append(
-                layer.register_forward_hook(
-                    lambda _module, _inputs, output, layer_idx=layer_idx: hf_layer_outputs.__setitem__(
-                        layer_idx, output.detach().float().cpu()
-                    )
-                )
+            hf_layer_hooks.append(layer.register_forward_hook(_capture_hf_layer(layer_idx)))
+        hf_layer_hooks.append(
+            hf_text_model.norm.register_forward_hook(
+                lambda _module, _inputs, output: hf_final_norm_output.__setitem__("value", output.detach().cpu())
             )
+        )
 
     prompt = "The capital of France is"
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
@@ -725,6 +776,90 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
             tt_hidden = tt_layer_outputs[layer_idx].reshape(-1, model_args.hidden_size)[0]
             _, layer_pcc = compare_tensors(tt_hidden, hf_hidden, pcc_threshold=0.0)
             logger.info(f"Decode layer[{layer_idx:02d}] PCC: {layer_pcc}")
+
+        # Replay every decoder layer with the exact HF hidden state and PLI
+        # input for this decode position. The populated TT KV caches remain the
+        # attention context, while upstream hidden-state drift is removed.
+        decode_rope = {}
+        for layer_type in {layer.layer_type for layer in tt_model.layers}:
+            cos_2d, sin_2d = tt_model.rope_caches_2d[layer_type]
+            decode_rope[layer_type] = (
+                ttnn.unsqueeze_to_4D(ttnn.embedding(device_inputs[1], cos_2d, layout=ttnn.TILE_LAYOUT)),
+                ttnn.unsqueeze_to_4D(ttnn.embedding(device_inputs[1], sin_2d, layout=ttnn.TILE_LAYOUT)),
+            )
+        for layer_idx, layer in enumerate(tt_model.layers):
+            input_tt = ttnn.from_torch(
+                hf_layer_inputs[layer_idx].unsqueeze(1),
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=replicate,
+            )
+            hf_pli = hf_pli_inputs.get(layer_idx)
+            pli_tt = None
+            if hf_pli is not None:
+                pli_tt = ttnn.from_torch(
+                    hf_pli.unsqueeze(1),
+                    device=mesh_device,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                    mesh_mapper=replicate,
+                )
+            intrinsic_tt = layer(
+                input_tt,
+                rope_mats=decode_rope[layer.layer_type],
+                position_idx=device_inputs[1],
+                page_table=None,
+                kv_cache=tt_kv_cache[layer_idx],
+                is_decode=True,
+                token_index=None,
+                per_layer_input=pli_tt,
+                is_kv_shared=layer_idx in tt_model.kv_shared_layer_map,
+                position_idx_cache=device_inputs[2],
+                rope_presliced=True,
+            )
+            intrinsic_device = ttnn.get_device_tensors(intrinsic_tt)[0]
+            intrinsic_hidden = ttnn.to_torch(intrinsic_device).reshape(-1, model_args.hidden_size)[0]
+            hf_hidden = hf_layer_outputs[layer_idx].reshape(-1, model_args.hidden_size)[-1].float()
+            _, intrinsic_pcc = compare_tensors(intrinsic_hidden, hf_hidden, pcc_threshold=0.0)
+            logger.info(f"Intrinsic decode layer[{layer_idx:02d}] PCC: {intrinsic_pcc}")
+            intrinsic_tt.deallocate(True)
+            if pli_tt is not None:
+                pli_tt.deallocate(True)
+        for cos_pos, sin_pos in decode_rope.values():
+            cos_pos.deallocate(True)
+            sin_pos.deallocate(True)
+
+        final_norm_input_tt = ttnn.from_torch(
+            hf_layer_outputs[len(tt_model.layers) - 1].unsqueeze(1),
+            device=mesh_device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            mesh_mapper=replicate,
+        )
+        intrinsic_norm_tt = tt_model.norm.forward(final_norm_input_tt)
+        intrinsic_norm = ttnn.to_torch(ttnn.get_device_tensors(intrinsic_norm_tt)[0]).reshape(
+            -1, model_args.hidden_size
+        )[0]
+        hf_norm = hf_final_norm_output["value"].reshape(-1, model_args.hidden_size)[-1].float()
+        _, norm_pcc = compare_tensors(intrinsic_norm, hf_norm, pcc_threshold=0.0)
+        logger.info(f"Intrinsic decode final norm PCC: {norm_pcc}")
+        intrinsic_norm_tt.deallocate(True)
+
+        lm_head_input_tt = ttnn.from_torch(
+            hf_final_norm_output["value"].unsqueeze(1),
+            device=mesh_device,
+            layout=ttnn.TILE_LAYOUT,
+            dtype=ttnn.bfloat16,
+            mesh_mapper=replicate,
+        )
+        intrinsic_logits_tt = tt_model._apply_lm_head(lm_head_input_tt, is_decode=False)
+        intrinsic_logits = ttnn.to_torch(ttnn.get_device_tensors(intrinsic_logits_tt)[0]).reshape(-1)[
+            : model_args.vocab_size
+        ]
+        _, lm_head_pcc = compare_tensors(intrinsic_logits, hf_decode_logits, pcc_threshold=0.0)
+        logger.info(f"Intrinsic decode LM head PCC: {lm_head_pcc}")
+        intrinsic_logits_tt.deallocate(True)
     assert passing, f"Full model decode PCC too low: {pcc_msg}"
 
 
