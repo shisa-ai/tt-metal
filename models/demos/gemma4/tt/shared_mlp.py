@@ -101,7 +101,9 @@ class SharedMLP:
         """
         # gate = GELU(x @ gate_proj)
         gate = ttnn.linear(hidden_states, self.gate_proj)
-        gate = ttnn.gelu(gate, fast_and_approximate_mode=True)
+        # Gemma 4's GeGLU is numerically sensitive across layers and decode
+        # steps; FastLut drift can change greedy token selection.
+        gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
 
         # up = x @ up_proj
         up = ttnn.linear(hidden_states, self.up_proj)
