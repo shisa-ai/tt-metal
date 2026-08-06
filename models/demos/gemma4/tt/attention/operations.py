@@ -39,6 +39,36 @@ PREFILL_CHUNK_SIZE = int(os.environ.get("GEMMA4_PREFILL_CHUNK_SIZE", "8192"))
 # 31744 < 32768. Must be a multiple of TILE (32).
 PREFILL_SLIDING_CHUNK_SIZE = int(os.environ.get("GEMMA4_PREFILL_SLIDING_CHUNK_SIZE", "30720"))
 
+QKV_COMPUTE_PROFILE_ENV = "GEMMA4_QKV_COMPUTE_PROFILE"
+QKV_HIFI3_FP32_ACC_PROFILE = "hifi3_fp32_acc"
+QKV_COMPUTE_PROFILES = frozenset({QKV_HIFI3_FP32_ACC_PROFILE})
+
+
+def _qkv_compute_kernel_config(hidden_states):
+    """Return an explicitly selected QKV compute profile, if any.
+
+    The unset path deliberately returns ``None`` so ``apply_qkv_projection``
+    keeps the operation default.  The opt-in profile is the all-layer replay
+    candidate: exact HiFi3 math with FP32 destination accumulation.
+    """
+    profile = os.environ.get(QKV_COMPUTE_PROFILE_ENV) or None
+    if profile is None:
+        return None
+    if profile not in QKV_COMPUTE_PROFILES:
+        supported = ", ".join(sorted(QKV_COMPUTE_PROFILES))
+        raise ValueError(f"{QKV_COMPUTE_PROFILE_ENV} must be one of: {supported}; got {profile!r}")
+
+    device = hidden_states.device()
+    if device is None:
+        raise ValueError(f"{QKV_COMPUTE_PROFILE_ENV}={profile} requires a device-resident activation")
+    return ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi3,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=False,
+    )
+
 
 def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config=None):
     """Fused QKV matmul (no bias for Gemma4).
@@ -46,7 +76,11 @@ def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config
     ``memory_config`` lets the packed-verify decode keep the projection output
     resident on L1; ``None`` keeps the op default (DRAM) for existing callers.
     """
-    return ttnn.linear(hidden_states, weights.wqkv, memory_config=memory_config)
+    compute_kernel_config = _qkv_compute_kernel_config(hidden_states)
+    kwargs = {"memory_config": memory_config}
+    if compute_kernel_config is not None:
+        kwargs["compute_kernel_config"] = compute_kernel_config
+    return ttnn.linear(hidden_states, weights.wqkv, **kwargs)
 
 
 def split_qkv_heads_decode(xqkv_fused, config, is_global: bool, tp: int = 1, kv_replicated: bool = False):
