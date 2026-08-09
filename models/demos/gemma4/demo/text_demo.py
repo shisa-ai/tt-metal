@@ -752,7 +752,10 @@ def run_generation(
     # Load tokenizer
     profiler.start("loading_inputs")
     tokenizer = _load_text_tokenizer(model_path)
-    stop_tokens = set(tokenizer.stop_tokens)
+    # List, not set: the native-parity runner can wrap stop_tokens with a
+    # matcher object whose __eq__ is the membership test; set() would need
+    # __hash__ and would bypass that matcher anyway.
+    stop_tokens = list(tokenizer.stop_tokens)
     logger.info(f"Tokenizer loaded from {model_path}")
     profiler.end("loading_inputs")
 
