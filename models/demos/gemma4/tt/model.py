@@ -815,8 +815,13 @@ class Gemma4Model:
             # Convert per-layer input to device tensor if available
             pli_tt = None
             if pli_combined_tt is not None:
-                # On-device decode: slice layer i from combined [1, 1, n_layers, pli_size]
-                pli_tt = pli_combined_tt[:, :, i : i + 1, :]
+                # On-device decode. Layouts:
+                #   * [1, 1, n_layers, pli_size] — single-user
+                #   * [1, n_layers, B, pli_size] — batched (one row per user)
+                if pli_combined_tt.shape[1] == len(self.layers):
+                    pli_tt = pli_combined_tt[:, i : i + 1, :, :]  # [1, 1, B, pli_size]
+                else:
+                    pli_tt = pli_combined_tt[:, :, i : i + 1, :]  # [1, 1, 1, pli_size]
             elif pli_device_tensors is not None:
                 # Pre-computed device tensors (legacy trace mode). Length was
                 # validated to match len(self.layers) for PLI models above.
@@ -1630,16 +1635,38 @@ class Gemma4Model:
             pt = page_table if page_table.dim() > 1 else page_table.unsqueeze(0)
             page_table_tt = ttnn.from_torch(pt, layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.int32, mesh_mapper=replicate)
 
-        # PLI (E2B/E4B per-layer inputs). 31B has none. Batched PLI would need
-        # per-user stacking + model-side per-user slicing — not yet wired up.
+        # PLI (E2B/E4B per-layer inputs). 31B has none. For batch>1 each user
+        # needs its own PLI; we compute per-user on host (embedding lookup is
+        # cheap at [1,1,pli] per user) and upload one [1, n_layers, B, pli]
+        # tensor. Device-side slicing becomes per-layer-then-split-user.
         pli_tt = None
         if self.hidden_size_per_layer_input and self.per_layer_input_weights:
-            if batch != 1:
-                raise NotImplementedError("Batched decode with per-layer inputs (E2B/E4B) is not yet supported")
-            _, pli = self.compute_host_embeddings(int(tok_flat[0].item()))
-            if pli is not None:
+            n_layers = len(self.layers)
+            pli_size = self.hidden_size_per_layer_input
+            if batch == 1:
+                _, pli = self.compute_host_embeddings(int(tok_flat[0].item()))
+                if pli is not None:
+                    pli_tt = ttnn.from_torch(
+                        pli.to(torch.bfloat16), layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16, mesh_mapper=replicate
+                    )
+            else:
+                # Compute PLI per user (each call returns [1, 1, n_layers, pli_size])
+                per_user_pli = []
+                for user in range(batch):
+                    _, pli_u = self.compute_host_embeddings(int(tok_flat[user].item()))
+                    if pli_u is None:
+                        raise ValueError("batch>1 requires compute_host_embeddings to return PLI for every user")
+                    # Collapse the leading (1,1) dims: [n_layers, pli_size]
+                    per_user_pli.append(pli_u.reshape(n_layers, pli_size))
+                # Stack users on dim 1: [n_layers, B, pli_size], then add the two
+                # leading dims so device slicing `combined[:, layer, :, :]` gives [1, B, pli].
+                pli_batched = torch.stack(per_user_pli, dim=1)  # [n_layers, B, pli_size]
+                pli_host = pli_batched.unsqueeze(0)  # [1, n_layers, B, pli_size]
                 pli_tt = ttnn.from_torch(
-                    pli.to(torch.bfloat16), layout=ttnn.ROW_MAJOR_LAYOUT, dtype=ttnn.bfloat16, mesh_mapper=replicate
+                    pli_host.to(torch.bfloat16),
+                    layout=ttnn.ROW_MAJOR_LAYOUT,
+                    dtype=ttnn.bfloat16,
+                    mesh_mapper=replicate,
                 )
 
         return (tokens_tt, pos_tt, pos_int32_tt, page_table_tt, pli_tt)
