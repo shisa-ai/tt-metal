@@ -61,7 +61,18 @@ def _load_text_tokenizer(model_path):
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
-    tokenizer.stop_tokens = list(dict.fromkeys(token_id for token_id in (eos_token_ids or []) if token_id is not None))
+    if eos_token_ids is None:
+        eos_token_ids = []
+    elif not isinstance(eos_token_ids, (list, tuple)):
+        # Non-iterable sentinel (e.g. the native-parity runner's stop matcher,
+        # which owns stop semantics through its own stop_tokens property).
+        # Do not clobber the wrapper's stop list here.
+        logger.info(
+            f"eos fallback yielded non-iterable {type(eos_token_ids).__name__}; "
+            "leaving tokenizer stop_tokens to the caller"
+        )
+        return tokenizer
+    tokenizer.stop_tokens = list(dict.fromkeys(token_id for token_id in eos_token_ids if token_id is not None))
     if not tokenizer.stop_tokens and tokenizer.eos_token_id is not None:
         tokenizer.stop_tokens = [tokenizer.eos_token_id]
     logger.info(f"Gemma4 stop token IDs: {tokenizer.stop_tokens}")
