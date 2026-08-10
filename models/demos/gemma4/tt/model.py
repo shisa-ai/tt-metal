@@ -21,6 +21,7 @@ from loguru import logger
 from tracy import signpost
 
 import ttnn
+from models.common.modules.mlp.mlp_1d import _dram_matmul_config, _dram_shard_core_grid
 from models.common.sampling.generator import SamplingGenerator
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
@@ -36,6 +37,19 @@ from models.demos.gemma4.utils.substate import substate
 # tt_transformers Generator (the model returns logits in sampling layout),
 # so it is profiled there / by op name (SamplingDeviceOperation, TopK).
 LM_HEAD_SIGNPOST = "gemma4_lm_head"
+LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE = 8192
+
+
+def _create_lm_head_dram_sharded_weight_config(mesh_device, k: int, n: int):
+    """Width-shard one TP1 LM-head chunk evenly over the device DRAM banks."""
+    dram_size = mesh_device.dram_grid_size()
+    dram_cores = dram_size.x * dram_size.y
+    dram_grid = ttnn.CoreRangeSet(
+        {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(dram_size.x - 1, dram_size.y - 1))}
+    )
+    padded_n = ((n + ttnn.TILE_SIZE * dram_cores - 1) // (ttnn.TILE_SIZE * dram_cores)) * (ttnn.TILE_SIZE * dram_cores)
+    shard_spec = ttnn.ShardSpec(dram_grid, (k, padded_n // dram_cores), ttnn.ShardOrientation.ROW_MAJOR)
+    return ttnn.MemoryConfig(ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.DRAM, shard_spec)
 
 
 def _scaled_host_embeddings(input_ids, embedding_weight, embed_scale):
@@ -348,28 +362,85 @@ class Gemma4Model:
             )
 
             # LM head (tied with embeddings): column-parallel (shard vocab dim)
-            # Each device holds [hidden, vocab/TP]; all-gather logits after softcapping.
-            # Default is bfloat16 — bfloat8_b is generally too lossy for 262k-vocab
-            # argmax, but the override is exposed for systems that genuinely
-            # need the DRAM relief and can tolerate the precision loss.
-            lm_head_weight = embed_weight.transpose(0, 1).unsqueeze(0).unsqueeze(0)
-            if tp > 1:
-                lm_mapper = mesh_config.column_parallel(mesh_device)
-            else:
-                lm_mapper = replicate
+            # when TP > 1. At TP1, the full 262k-column BF16 projection is a
+            # decode bandwidth bottleneck. Split it into 8192-column weights
+            # width-sharded across DRAM banks so the DRAM-sharded matmul can
+            # sustain substantially more of the device bandwidth. Keeping the
+            # chunks separate also bounds the matmul's L1 circular buffers.
             lm_head_suffix = f"_{dtype_to_str(lm_head_dtype)}"
-            self.lm_head_weight = ttnn.as_tensor(
-                lm_head_weight,
-                device=mesh_device,
-                dtype=lm_head_dtype,
-                layout=ttnn.TILE_LAYOUT,
-                mesh_mapper=lm_mapper,
-                cache_file_name=get_cache_file_name(tensor_cache_path, f"lm_head.weight{tp_suffix}{lm_head_suffix}"),
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            use_tp1_dram_sharded_lm_head = (
+                tp == 1
+                and lm_head_dtype == ttnn.bfloat16
+                and self.vocab_size % LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE == 0
+                and self.hidden_size % ttnn.TILE_SIZE == 0
             )
+            self.lm_head_dram_sharded_weights = []
+            if use_tp1_dram_sharded_lm_head:
+                chunk_size = LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE
+                weight_memcfg = _create_lm_head_dram_sharded_weight_config(mesh_device, self.hidden_size, chunk_size)
+                for split_idx, start in enumerate(range(0, self.vocab_size, chunk_size)):
+                    # Slice vocab rows before transposing so only one ~42 MiB
+                    # host chunk is materialized at a time during cache creation.
+                    chunk = embed_weight[start : start + chunk_size].transpose(0, 1).contiguous()
+                    chunk = chunk.unsqueeze(0).unsqueeze(0)
+                    self.lm_head_dram_sharded_weights.append(
+                        ttnn.as_tensor(
+                            chunk,
+                            device=mesh_device,
+                            dtype=lm_head_dtype,
+                            layout=ttnn.TILE_LAYOUT,
+                            mesh_mapper=replicate,
+                            cache_file_name=get_cache_file_name(
+                                tensor_cache_path,
+                                f"lm_head.weight_tp1_dram_sharded_{chunk_size}_{split_idx:02d}{lm_head_suffix}",
+                            ),
+                            memory_config=weight_memcfg,
+                        )
+                    )
+                lm_head_core_grid = _dram_shard_core_grid(self.hidden_size)
+                self.lm_head_dram_sharded_input_memcfg = ttnn.create_sharded_memory_config(
+                    (ttnn.TILE_SIZE, self.hidden_size // lm_head_core_grid.num_cores),
+                    lm_head_core_grid,
+                    ttnn.ShardStrategy.WIDTH,
+                    ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                )
+                self.lm_head_dram_sharded_program_config = _dram_matmul_config(
+                    ttnn.TILE_SIZE,
+                    self.hidden_size,
+                    chunk_size,
+                    lm_head_core_grid.num_cores,
+                )
+                self.lm_head_compute_kernel_config = ttnn.init_device_compute_kernel_config(
+                    mesh_device.arch(),
+                    math_fidelity=ttnn.MathFidelity.HiFi2,
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=False,
+                    packer_l1_acc=True,
+                )
+                self.lm_head_weight = None
+                logger.info(
+                    f"TP1 LM head: {len(self.lm_head_dram_sharded_weights)} x {chunk_size}-column "
+                    "BF16 DRAM-sharded weights"
+                )
+            else:
+                lm_head_weight = embed_weight.transpose(0, 1).unsqueeze(0).unsqueeze(0)
+                lm_mapper = mesh_config.column_parallel(mesh_device) if tp > 1 else replicate
+                self.lm_head_weight = ttnn.as_tensor(
+                    lm_head_weight,
+                    device=mesh_device,
+                    dtype=lm_head_dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    mesh_mapper=lm_mapper,
+                    cache_file_name=get_cache_file_name(
+                        tensor_cache_path, f"lm_head.weight{tp_suffix}{lm_head_suffix}"
+                    ),
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                )
         else:
             self.embedding_weight = None
             self.lm_head_weight = None
+            self.lm_head_dram_sharded_weights = []
 
         # Per-layer input embeddings (E2B/E4B) — kept as CPU torch tensors for computation
         # Also store embedding weight reference for decode per-layer input
@@ -1012,7 +1083,10 @@ class Gemma4Model:
         # decode region totals.
         if is_decode:
             signpost(header=LM_HEAD_SIGNPOST)
-        if self.lm_head_weight is not None:
+        if self.lm_head_dram_sharded_weights:
+            logits = self._apply_tp1_dram_sharded_lm_head(hidden_states)
+            hidden_states.deallocate(True)
+        elif self.lm_head_weight is not None:
             lm_head_pc = _get_lm_head_program_config(
                 self.mesh_device,
                 m=hidden_states.shape[2],
@@ -1032,7 +1106,8 @@ class Gemma4Model:
         if is_decode:
             signpost(header=LM_HEAD_SIGNPOST)
 
-        if self.mesh_config is not None and self.mesh_config.tp > 1 and self.lm_head_weight is not None:
+        has_lm_head = self.lm_head_weight is not None or bool(self.lm_head_dram_sharded_weights)
+        if self.mesh_config is not None and self.mesh_config.tp > 1 and has_lm_head:
             if self.sampling is not None and is_decode:
                 pass  # Sampling module handles TP-sharded logits directly
             else:
@@ -1041,6 +1116,41 @@ class Gemma4Model:
                 logits = ccl_allgather(logits, self.mesh_config, self.ccl_manager)
 
         return logits
+
+    def _apply_tp1_dram_sharded_lm_head(self, hidden_states):
+        """Apply the split TP1 LM head in 32-row tiles.
+
+        Decode and last-token prefill already have exactly one tile. Tiling
+        larger direct-prefill inputs keeps each chunk's L1 output bounded while
+        preserving the existing full-sequence API.
+        """
+        rows = hidden_states.shape[2]
+        if rows > ttnn.TILE_SIZE:
+            if rows % ttnn.TILE_SIZE != 0:
+                raise ValueError(f"TP1 DRAM-sharded LM head requires tile-aligned rows, got {rows}")
+            row_outputs = []
+            for start in range(0, rows, ttnn.TILE_SIZE):
+                row_tile = ttnn.slice(
+                    hidden_states,
+                    (0, 0, start, 0),
+                    (hidden_states.shape[0], hidden_states.shape[1], start + ttnn.TILE_SIZE, self.hidden_size),
+                )
+                row_outputs.append(self._apply_tp1_dram_sharded_lm_head(row_tile))
+            return ttnn.concat(row_outputs, dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+
+        sharded_input = ttnn.to_memory_config(hidden_states, self.lm_head_dram_sharded_input_memcfg)
+        chunks = []
+        for weight in self.lm_head_dram_sharded_weights:
+            sharded_output = ttnn.linear(
+                sharded_input,
+                weight,
+                compute_kernel_config=self.lm_head_compute_kernel_config,
+                program_config=self.lm_head_dram_sharded_program_config,
+                memory_config=ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG,
+                dtype=ttnn.bfloat16,
+            )
+            chunks.append(ttnn.sharded_to_interleaved(sharded_output, memory_config=ttnn.DRAM_MEMORY_CONFIG))
+        return ttnn.concat(chunks, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
     def embed_tokens(self, tokens):
         """Embed input tokens and scale by sqrt(hidden_size).
