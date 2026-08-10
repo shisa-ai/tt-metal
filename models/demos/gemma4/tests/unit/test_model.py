@@ -1005,12 +1005,12 @@ def test_single_decode_perf(mesh_device, reset_seeds, request):
           TT_VISIBLE_DEVICES=0000:06:00.0 \
           TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=20000 \
           python -m tracy -p -r -v -m pytest \
-          "models/demos/gemma4/tests/unit/test_model.py::test_single_decode_perf[1x1]"
+          "models/demos/gemma4/tests/unit/test_model.py::test_single_decode_perf[wormhole_b0-1x1]"
 
         HF_MODEL=google/gemma-4-31B-it \
           TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=20000 \
           python -m tracy -p -r -v -m pytest \
-          "models/demos/gemma4/tests/unit/test_model.py::test_single_decode_perf[1x4]"
+          "models/demos/gemma4/tests/unit/test_model.py::test_single_decode_perf[wormhole_b0-1x4]"
     """
     import os
 
