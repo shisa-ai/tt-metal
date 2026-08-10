@@ -972,6 +972,11 @@ def _build_decode_harness(mesh_device, model_path, decode_pos, max_seq_len=8192,
     "mesh_device, device_params",
     [
         pytest.param(
+            (1, 1),
+            {"trace_region_size": 200_000_000},
+            id="1x1",
+        ),
+        pytest.param(
             (1, 4),
             {"fabric_config": ttnn.FabricConfig.FABRIC_1D, "trace_region_size": 200_000_000},
             id="1x4",
@@ -996,10 +1001,16 @@ def test_single_decode_perf(mesh_device, reset_seeds, request):
     the signposted region (or to rows with a METAL TRACE REPLAY SESSION ID)
     yields steady-state device time uncluttered by compilation.
 
+        HF_MODEL=google/gemma-4-E2B-it \
+          TT_VISIBLE_DEVICES=0000:06:00.0 \
+          TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=20000 \
+          python -m tracy -p -r -v -m pytest \
+          "models/demos/gemma4/tests/unit/test_model.py::test_single_decode_perf[1x1]"
+
         HF_MODEL=google/gemma-4-31B-it \
           TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=20000 \
           python -m tracy -p -r -v -m pytest \
-          "models/demos/gemma4/tests/unit/test_model.py::test_single_decode_perf"
+          "models/demos/gemma4/tests/unit/test_model.py::test_single_decode_perf[1x4]"
     """
     import os
 
