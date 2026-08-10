@@ -395,6 +395,7 @@ class Gemma4Model:
         # stash above.
         self._decode_pli_combined = None
         self.per_layer_input_weights = {}
+        self._per_layer_model_projection_fp32 = None
         if self.hidden_size_per_layer_input and state_dict:
             pli_size = self.hidden_size_per_layer_input
             # Try both key formats
@@ -628,7 +629,16 @@ class Gemma4Model:
 
         # 2. Projection from main embeddings
         proj_w = w["per_layer_model_projection"]  # [full_n_layers * pli_size, hidden]
-        pli_proj = F.linear(embeds_torch.float(), proj_w.float()) * self.per_layer_model_projection_scale
+        # Preserve the existing FP32 projection semantics without converting
+        # the same 55 MB BF16 E4B matrix into a new 110 MB FP32 tensor for
+        # every decode token.  Keep this lazy so models without PLI pay no
+        # memory cost and the one-time conversion happens on the first PLI
+        # prefill/decode call rather than during model construction.
+        proj_w_fp32 = getattr(self, "_per_layer_model_projection_fp32", None)
+        if proj_w_fp32 is None:
+            proj_w_fp32 = proj_w.float()
+            self._per_layer_model_projection_fp32 = proj_w_fp32
+        pli_proj = F.linear(embeds_torch.float(), proj_w_fp32) * self.per_layer_model_projection_scale
         pli_proj = pli_proj.reshape(*embeds_torch.shape[:-1], full_n_layers, pli_size)
 
         # 3. Norm the projection
