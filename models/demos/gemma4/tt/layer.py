@@ -39,6 +39,8 @@ Forward flow (matching HF exactly):
   x *= layer_scalar
 """
 
+import os
+
 import torch
 
 import ttnn
@@ -49,6 +51,33 @@ from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.tt.shared_mlp import SharedMLP
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
+
+PLI_PROJECTION_COMPUTE_PROFILE_ENV = "GEMMA4_PLI_PROJECTION_COMPUTE_PROFILE"
+PLI_PROJECTION_LAYER0_HIFI3_FP32_ACC_PROFILE = "layer0_hifi3_fp32_acc"
+PLI_PROJECTION_COMPUTE_PROFILES = frozenset({PLI_PROJECTION_LAYER0_HIFI3_FP32_ACC_PROFILE})
+
+
+def _pli_projection_compute_kernel_config(hidden_states, layer_idx):
+    """Return the opt-in layer-0 PLI projection compute profile, if selected."""
+    profile = os.environ.get(PLI_PROJECTION_COMPUTE_PROFILE_ENV) or None
+    if profile is None:
+        return None
+    if profile not in PLI_PROJECTION_COMPUTE_PROFILES:
+        supported = ", ".join(sorted(PLI_PROJECTION_COMPUTE_PROFILES))
+        raise ValueError(f"{PLI_PROJECTION_COMPUTE_PROFILE_ENV} must be one of: " f"{supported}; got {profile!r}")
+    if layer_idx != 0:
+        return None
+
+    device = hidden_states.device()
+    if device is None:
+        raise ValueError(f"{PLI_PROJECTION_COMPUTE_PROFILE_ENV}={profile} requires a " "device-resident activation")
+    return ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi3,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=False,
+    )
 
 
 class Gemma4DecoderLayer:
@@ -319,7 +348,11 @@ class Gemma4DecoderLayer:
             gated = ttnn.linear(hidden_states, self.per_layer_input_gate)
             gated = ttnn.gelu(gated, fast_and_approximate_mode=True)
             gated = ttnn.mul(gated, per_layer_input)
-            projected = ttnn.linear(gated, self.per_layer_projection)
+            projection_kwargs = {}
+            projection_compute_kernel_config = _pli_projection_compute_kernel_config(gated, self.layer_idx)
+            if projection_compute_kernel_config is not None:
+                projection_kwargs["compute_kernel_config"] = projection_compute_kernel_config
+            projected = ttnn.linear(gated, self.per_layer_projection, **projection_kwargs)
             normed_pli = self.post_per_layer_input_norm.forward(projected)
             hidden_states = ttnn.add(residual_pli, normed_pli)
             if len(hidden_states.shape) > 4:
