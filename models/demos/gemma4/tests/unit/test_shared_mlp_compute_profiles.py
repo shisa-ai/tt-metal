@@ -95,9 +95,17 @@ def test_down_proj_decode_program_profiles_select_block_width(monkeypatch):
     activation = _FakeActivation(_FakeDevice())
 
     cases = (
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W1_PROFILE, 1),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W4_PROFILE, 4),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W5_PROFILE, 5),
         (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W8_PROFILE, 8),
         (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W10_PROFILE, 10),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W16_PROFILE, 16),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W20_PROFILE, 20),
         (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W32_PROFILE, 32),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W40_PROFILE, 40),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W64_PROFILE, 64),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W80_PROFILE, 80),
     )
     for profile, expected_width in cases:
         monkeypatch.setenv(shared_mlp.DOWN_PROJ_PROGRAM_PROFILE_ENV, profile)
@@ -111,7 +119,10 @@ def test_down_proj_program_profile_rejects_unknown_value(monkeypatch, expect_err
     with expect_error(
         ValueError,
         "GEMMA4_SHARED_MLP_DOWN_PROJ_PROGRAM_PROFILE must be one of: "
-        "layer38_decode_mcast1d_w10, layer38_decode_mcast1d_w32, layer38_decode_mcast1d_w8",
+        "layer38_decode_mcast1d_w1, layer38_decode_mcast1d_w10, layer38_decode_mcast1d_w16, "
+        "layer38_decode_mcast1d_w20, layer38_decode_mcast1d_w32, layer38_decode_mcast1d_w4, "
+        "layer38_decode_mcast1d_w40, layer38_decode_mcast1d_w5, layer38_decode_mcast1d_w64, "
+        "layer38_decode_mcast1d_w8, layer38_decode_mcast1d_w80",
     ):
         shared_mlp._apply_down_projection(_FakeActivation(_FakeDevice()), "weight", layer_idx=38)
 
@@ -184,6 +195,7 @@ def test_down_proj_hifi3_fp32_l1_profile_enables_packer_l1(monkeypatch):
 def test_down_proj_remaining_safe_profile_specs(monkeypatch):
     cases = (
         (shared_mlp.DOWN_PROJ_LAYER38_HIFI2_FP32_ACC_PROFILE, ttnn.MathFidelity.HiFi2, True, False),
+        (shared_mlp.DOWN_PROJ_LAYER38_HIFI2_FP32_L1_ACC_PROFILE, ttnn.MathFidelity.HiFi2, True, True),
         (shared_mlp.DOWN_PROJ_LAYER38_HIFI4_BF16_L1_ACC_PROFILE, ttnn.MathFidelity.HiFi4, False, True),
         (shared_mlp.DOWN_PROJ_LAYER38_HIFI3_BF16_L1_ACC_PROFILE, ttnn.MathFidelity.HiFi3, False, True),
         (shared_mlp.DOWN_PROJ_LAYER38_LOFI_FP32_ACC_PROFILE, ttnn.MathFidelity.LoFi, True, False),
@@ -218,9 +230,9 @@ def test_down_proj_compute_profile_rejects_unknown_value(monkeypatch, expect_err
     with expect_error(
         ValueError,
         "GEMMA4_SHARED_MLP_DOWN_PROJ_COMPUTE_PROFILE must be one of: "
-        "layer38_hifi2_fp32_acc, layer38_hifi3_bf16_l1_acc, layer38_hifi3_fp32_acc, "
-        "layer38_hifi3_fp32_l1_acc, layer38_hifi4_bf16_l1_acc, layer38_lofi_bf16_l1_acc, "
-        "layer38_lofi_fp32_acc",
+        "layer38_hifi2_fp32_acc, layer38_hifi2_fp32_l1_acc, layer38_hifi3_bf16_l1_acc, "
+        "layer38_hifi3_fp32_acc, layer38_hifi3_fp32_l1_acc, layer38_hifi4_bf16_l1_acc, "
+        "layer38_lofi_bf16_l1_acc, layer38_lofi_fp32_acc",
     ):
         shared_mlp._apply_down_projection(_FakeActivation(_FakeDevice()), "weight", layer_idx=38)
 
