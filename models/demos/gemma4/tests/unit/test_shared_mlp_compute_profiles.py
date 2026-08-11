@@ -98,13 +98,46 @@ def test_down_proj_hifi3_fp32_l1_profile_enables_packer_l1(monkeypatch):
     ]
 
 
+def test_down_proj_remaining_safe_profile_specs(monkeypatch):
+    cases = (
+        (shared_mlp.DOWN_PROJ_LAYER38_HIFI2_FP32_ACC_PROFILE, ttnn.MathFidelity.HiFi2, True, False),
+        (shared_mlp.DOWN_PROJ_LAYER38_HIFI4_BF16_L1_ACC_PROFILE, ttnn.MathFidelity.HiFi4, False, True),
+        (shared_mlp.DOWN_PROJ_LAYER38_HIFI3_BF16_L1_ACC_PROFILE, ttnn.MathFidelity.HiFi3, False, True),
+        (shared_mlp.DOWN_PROJ_LAYER38_LOFI_FP32_ACC_PROFILE, ttnn.MathFidelity.LoFi, True, False),
+        (shared_mlp.DOWN_PROJ_LAYER38_LOFI_BF16_L1_ACC_PROFILE, ttnn.MathFidelity.LoFi, False, True),
+    )
+    init_calls = []
+    monkeypatch.setattr(
+        ttnn,
+        "init_device_compute_kernel_config",
+        lambda *args, **kwargs: init_calls.append((args, kwargs)) or "compute_config",
+    )
+    monkeypatch.setattr(ttnn, "linear", lambda *args, **kwargs: "output")
+    activation = _FakeActivation(_FakeDevice())
+
+    for profile, fidelity, fp32, packer_l1 in cases:
+        monkeypatch.setenv(shared_mlp.DOWN_PROJ_COMPUTE_PROFILE_ENV, profile)
+        assert shared_mlp._apply_down_projection(activation, "weight", layer_idx=38) == "output"
+        assert init_calls[-1] == (
+            ("wormhole_b0",),
+            {
+                "math_fidelity": fidelity,
+                "math_approx_mode": False,
+                "fp32_dest_acc_en": fp32,
+                "packer_l1_acc": packer_l1,
+            },
+        )
+
+
 def test_down_proj_compute_profile_rejects_unknown_value(monkeypatch, expect_error):
     monkeypatch.setenv(shared_mlp.DOWN_PROJ_COMPUTE_PROFILE_ENV, "all_layers_hifi4")
 
     with expect_error(
         ValueError,
         "GEMMA4_SHARED_MLP_DOWN_PROJ_COMPUTE_PROFILE must be one of: "
-        "layer38_hifi3_fp32_acc, layer38_hifi3_fp32_l1_acc",
+        "layer38_hifi2_fp32_acc, layer38_hifi3_bf16_l1_acc, layer38_hifi3_fp32_acc, "
+        "layer38_hifi3_fp32_l1_acc, layer38_hifi4_bf16_l1_acc, layer38_lofi_bf16_l1_acc, "
+        "layer38_lofi_fp32_acc",
     ):
         shared_mlp._apply_down_projection(_FakeActivation(_FakeDevice()), "weight", layer_idx=38)
 
