@@ -43,6 +43,9 @@ LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE = 8192
 LM_HEAD_COMPUTE_PROFILE_ENV = "GEMMA4_LM_HEAD_COMPUTE_PROFILE"
 LM_HEAD_HIFI3_FP32_ACC_PROFILE = "hifi3_fp32_acc"
 LM_HEAD_COMPUTE_PROFILES = frozenset({LM_HEAD_HIFI3_FP32_ACC_PROFILE})
+FINAL_NORM_COMPUTE_PROFILE_ENV = "GEMMA4_FINAL_NORM_COMPUTE_PROFILE"
+FINAL_NORM_HIFI3_FP32_ACC_PROFILE = "hifi3_fp32_acc"
+FINAL_NORM_COMPUTE_PROFILES = frozenset({FINAL_NORM_HIFI3_FP32_ACC_PROFILE})
 
 
 def _get_tp1_dram_sharded_lm_head_compute_kernel_config(mesh_device):
@@ -59,6 +62,24 @@ def _get_tp1_dram_sharded_lm_head_compute_kernel_config(mesh_device):
         math_approx_mode=False,
         fp32_dest_acc_en=use_hifi3_fp32,
         packer_l1_acc=not use_hifi3_fp32,
+    )
+
+
+def _get_final_norm_compute_kernel_config(mesh_device):
+    """Build an opt-in final-RMSNorm profile while preserving TTNN defaults."""
+    profile = os.environ.get(FINAL_NORM_COMPUTE_PROFILE_ENV) or None
+    if profile is None:
+        return None
+    if profile not in FINAL_NORM_COMPUTE_PROFILES:
+        supported = ", ".join(sorted(FINAL_NORM_COMPUTE_PROFILES))
+        raise ValueError(f"{FINAL_NORM_COMPUTE_PROFILE_ENV} must be one of: {supported}; got {profile!r}")
+
+    return ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi3,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=False,
     )
 
 
@@ -587,6 +608,7 @@ class Gemma4Model:
             state_dict=norm_state,
             tensor_cache_path=f"{tensor_cache_path}/final_norm" if tensor_cache_path else None,
             mesh_config=mesh_config,
+            compute_kernel_config=_get_final_norm_compute_kernel_config(mesh_device),
         )
 
         # sampling_dp: number of independent sampling groups (one per mesh row).
