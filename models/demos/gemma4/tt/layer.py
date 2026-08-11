@@ -122,6 +122,12 @@ class Gemma4DecoderLayer:
         "post_feedforward_norm",
         "post_mlp_residual",
     )
+    ATTENTION_BOUNDARY_CAPTURE_NAMES = (
+        "input_norm",
+        "attention_output",
+        "post_attention_norm",
+        "post_attention_residual",
+    )
 
     def __init__(
         self,
@@ -283,6 +289,12 @@ class Gemma4DecoderLayer:
         if callback is not None:
             callback(self.layer_idx, boundary_name, value)
 
+    def _capture_attention_boundary(self, boundary_name, value):
+        """Synchronously expose an opt-in layer-local attention boundary."""
+        callback = getattr(self, "_attention_boundary_capture_callback", None)
+        if callback is not None:
+            callback(self.layer_idx, boundary_name, value)
+
     def __call__(
         self,
         hidden_states,
@@ -328,6 +340,7 @@ class Gemma4DecoderLayer:
         # 1. Attention block: norm -> attn -> post_attn_norm -> residual add
         residual = hidden_states
         normed = self.input_layernorm.forward(hidden_states)
+        self._capture_attention_boundary("input_norm", normed)
         if not is_decode and batch_size > 1:
             attn_in = ttnn.reshape(normed, [batch_size, 1, normed.shape[-2] // batch_size, -1])
         else:
@@ -357,7 +370,9 @@ class Gemma4DecoderLayer:
         if isinstance(attn_output, torch.Tensor):
             hidden_states = residual
         else:
+            self._capture_attention_boundary("attention_output", attn_output)
             attn_output = self.post_attention_layernorm.forward(attn_output)
+            self._capture_attention_boundary("post_attention_norm", attn_output)
             if not is_decode and batch_size > 1:
                 residual = ttnn.reshape(
                     residual, [1, 1, residual.shape[-2] * residual.shape[-3] * residual.shape[0], -1]
@@ -366,6 +381,7 @@ class Gemma4DecoderLayer:
             residual.deallocate(True)
             attn_output.deallocate(True)
 
+        self._capture_attention_boundary("post_attention_residual", hidden_states)
         self._capture_boundary("post_attention_residual", hidden_states)
 
         # 2. MLP + MoE block

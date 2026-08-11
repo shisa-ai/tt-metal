@@ -44,6 +44,20 @@ def test_decoder_mlp_boundary_capture_is_inert_until_callback_is_installed():
     assert captured == [(38, "post_feedforward_norm", marker)]
 
 
+def test_decoder_attention_boundary_capture_is_inert_until_callback_is_installed():
+    layer = object.__new__(Gemma4DecoderLayer)
+    layer.layer_idx = 38
+    marker = object()
+
+    layer._capture_attention_boundary("input_norm", marker)
+
+    captured = []
+    layer._attention_boundary_capture_callback = lambda *values: captured.append(values)
+    layer._capture_attention_boundary("post_attention_norm", marker)
+
+    assert captured == [(38, "post_attention_norm", marker)]
+
+
 def test_shared_mlp_boundary_capture_is_inert_until_callback_is_installed():
     mlp = object.__new__(SharedMLP)
     marker = object()
@@ -73,5 +87,15 @@ def test_mlp_call_exposes_boundaries_in_execution_order():
     for name in Gemma4DecoderLayer.MLP_BOUNDARY_CAPTURE_NAMES:
         method = "self._capture_boundary" if name in SharedMLP.BOUNDARY_CAPTURE_NAMES else "self._capture_mlp_boundary"
         offsets.append(source.index(f'{method}("{name}"'))
+
+    assert offsets == sorted(offsets)
+
+
+def test_attention_call_exposes_boundaries_in_execution_order():
+    source = inspect.getsource(Gemma4DecoderLayer.__call__)
+    offsets = [
+        source.index(f'self._capture_attention_boundary("{name}"')
+        for name in Gemma4DecoderLayer.ATTENTION_BOUNDARY_CAPTURE_NAMES
+    ]
 
     assert offsets == sorted(offsets)
