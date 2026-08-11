@@ -84,12 +84,34 @@ def test_down_proj_decode_program_profile_applies_only_to_exact_layer38_shape(mo
     ]
 
 
+def test_down_proj_decode_program_profiles_select_block_width(monkeypatch):
+    program_calls = []
+    monkeypatch.setattr(
+        ttnn,
+        "MatmulMultiCoreReuseMultiCast1DProgramConfig",
+        lambda **kwargs: program_calls.append(kwargs) or "program_config",
+    )
+    monkeypatch.setattr(ttnn, "linear", lambda *args, **kwargs: "output")
+    activation = _FakeActivation(_FakeDevice())
+
+    cases = (
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W8_PROFILE, 8),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W10_PROFILE, 10),
+        (shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W32_PROFILE, 32),
+    )
+    for profile, expected_width in cases:
+        monkeypatch.setenv(shared_mlp.DOWN_PROJ_PROGRAM_PROFILE_ENV, profile)
+        assert shared_mlp._apply_down_projection(activation, "weight", layer_idx=38) == "output"
+        assert program_calls[-1]["in0_block_w"] == expected_width
+
+
 def test_down_proj_program_profile_rejects_unknown_value(monkeypatch, expect_error):
     monkeypatch.setenv(shared_mlp.DOWN_PROJ_PROGRAM_PROFILE_ENV, "layer38_decode_w7")
 
     with expect_error(
         ValueError,
-        "GEMMA4_SHARED_MLP_DOWN_PROJ_PROGRAM_PROFILE must be one of: layer38_decode_mcast1d_w8",
+        "GEMMA4_SHARED_MLP_DOWN_PROJ_PROGRAM_PROFILE must be one of: "
+        "layer38_decode_mcast1d_w10, layer38_decode_mcast1d_w32, layer38_decode_mcast1d_w8",
     ):
         shared_mlp._apply_down_projection(_FakeActivation(_FakeDevice()), "weight", layer_idx=38)
 

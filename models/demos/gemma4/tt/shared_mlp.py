@@ -40,7 +40,14 @@ DOWN_PROJ_COMPUTE_PROFILE_SPECS = {
 }
 DOWN_PROJ_COMPUTE_PROFILES = frozenset(DOWN_PROJ_COMPUTE_PROFILE_SPECS)
 DOWN_PROJ_LAYER38_DECODE_MCAST1D_W8_PROFILE = "layer38_decode_mcast1d_w8"
-DOWN_PROJ_PROGRAM_PROFILES = frozenset({DOWN_PROJ_LAYER38_DECODE_MCAST1D_W8_PROFILE})
+DOWN_PROJ_LAYER38_DECODE_MCAST1D_W10_PROFILE = "layer38_decode_mcast1d_w10"
+DOWN_PROJ_LAYER38_DECODE_MCAST1D_W32_PROFILE = "layer38_decode_mcast1d_w32"
+DOWN_PROJ_PROGRAM_PROFILE_WIDTHS = {
+    DOWN_PROJ_LAYER38_DECODE_MCAST1D_W8_PROFILE: 8,
+    DOWN_PROJ_LAYER38_DECODE_MCAST1D_W10_PROFILE: 10,
+    DOWN_PROJ_LAYER38_DECODE_MCAST1D_W32_PROFILE: 32,
+}
+DOWN_PROJ_PROGRAM_PROFILES = frozenset(DOWN_PROJ_PROGRAM_PROFILE_WIDTHS)
 DOWN_PROJ_LAYER38_DECODE_INPUT_SHAPE = (1, 1, 1, 10240)
 
 
@@ -85,7 +92,7 @@ def _down_proj_program_config(hidden_states, layer_idx):
         raise ValueError(f"{DOWN_PROJ_PROGRAM_PROFILE_ENV}={profile} requires an 8x9 compute grid")
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
-        in0_block_w=8,
+        in0_block_w=DOWN_PROJ_PROGRAM_PROFILE_WIDTHS[profile],
         out_subblock_h=1,
         out_subblock_w=2,
         out_block_h=1,
