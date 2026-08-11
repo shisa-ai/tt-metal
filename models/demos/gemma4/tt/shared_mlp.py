@@ -257,6 +257,43 @@ def _prefill_down_program_config(mesh_device, intermediate_size, hidden_size, in
     )
 
 
+DOWN_PROJ_COMPUTE_PROFILE_ENV = "GEMMA4_SHARED_MLP_DOWN_PROJ_COMPUTE_PROFILE"
+DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE = "layer38_hifi3_fp32_acc"
+DOWN_PROJ_COMPUTE_PROFILES = frozenset({DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE})
+
+
+def _down_proj_compute_kernel_config(hidden_states, layer_idx):
+    """Return the opt-in layer-38 down-projection profile, if selected."""
+    profile = os.environ.get(DOWN_PROJ_COMPUTE_PROFILE_ENV) or None
+    if profile is None:
+        return None
+    if profile not in DOWN_PROJ_COMPUTE_PROFILES:
+        supported = ", ".join(sorted(DOWN_PROJ_COMPUTE_PROFILES))
+        raise ValueError(f"{DOWN_PROJ_COMPUTE_PROFILE_ENV} must be one of: {supported}")
+    if layer_idx != 38:
+        return None
+    device = hidden_states.device()
+    if device is None:
+        raise ValueError(f"{DOWN_PROJ_COMPUTE_PROFILE_ENV}={profile} requires a " "device-resident activation")
+    return ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi3,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=False,
+    )
+
+
+def _apply_down_projection(hidden_states, weight, layer_idx, program_config=None):
+    kwargs = {}
+    compute_kernel_config = _down_proj_compute_kernel_config(hidden_states, layer_idx)
+    if compute_kernel_config is not None:
+        kwargs["compute_kernel_config"] = compute_kernel_config
+    if program_config is not None:
+        kwargs["program_config"] = program_config
+    return ttnn.linear(hidden_states, weight, **kwargs)
+
+
 class SharedMLP:
     BOUNDARY_CAPTURE_NAMES = (
         "gate_projection",
@@ -275,6 +312,7 @@ class SharedMLP:
         ccl_manager=None,
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
+        layer_idx=None,
         fuse_gate_gelu_mul=None,
         decode_gate_up_in0_block_w=None,
         prefill_gate_up_in0_block_w=None,
@@ -284,6 +322,7 @@ class SharedMLP:
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
         self.ccl_manager = ccl_manager
+        self.layer_idx = layer_idx
         self.hidden_size = hf_config.hidden_size
         self.intermediate_size = hf_config.intermediate_size
 
@@ -466,10 +505,7 @@ class SharedMLP:
         up.deallocate(True)
 
         # output = hidden @ down_proj
-        if down_program_config is None:
-            output = ttnn.linear(hidden, self.down_proj)
-        else:
-            output = ttnn.linear(hidden, self.down_proj, program_config=down_program_config)
+        output = _apply_down_projection(hidden, self.down_proj, self.layer_idx, down_program_config)
         self._capture_boundary("down_projection", output)
         hidden.deallocate(True)
 
