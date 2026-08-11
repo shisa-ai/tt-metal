@@ -9,7 +9,16 @@ from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, mesh_device, hf_config, state_dict, tensor_cache_path=None, mesh_config=None, with_scale=True):
+    def __init__(
+        self,
+        mesh_device,
+        hf_config,
+        state_dict,
+        tensor_cache_path=None,
+        mesh_config=None,
+        with_scale=True,
+        compute_kernel_config=None,
+    ):
         super().__init__()
         self.with_scale = with_scale
 
@@ -38,6 +47,7 @@ class RMSNorm(nn.Module):
 
         self.eps = hf_config.rms_norm_eps
         self.mesh_device = mesh_device
+        self.compute_kernel_config = compute_kernel_config
 
         # Decode width-sharded fast path. The plain (interleaved) rms_norm runs
         # the RMS reduction over the full hidden width on few cores — ~76 us for
@@ -94,6 +104,7 @@ class RMSNorm(nn.Module):
             weight=self.tt_weight,
             epsilon=self.eps,
             program_config=self._sharded_cfg[1],
+            compute_kernel_config=self.compute_kernel_config,
         )
         x_sh.deallocate(True)
         out_interleaved = ttnn.sharded_to_interleaved(out, ttnn.DRAM_MEMORY_CONFIG)
@@ -118,7 +129,12 @@ class RMSNorm(nn.Module):
                 strategy=ttnn.ShardStrategy.WIDTH,
                 orientation=ttnn.ShardOrientation.ROW_MAJOR,
             )
-            tt_stats = ttnn.rms_norm_pre_all_gather(x, program_config=program_config, dtype=ttnn.bfloat16)
+            tt_stats = ttnn.rms_norm_pre_all_gather(
+                x,
+                program_config=program_config,
+                compute_kernel_config=self.compute_kernel_config,
+                dtype=ttnn.bfloat16,
+            )
 
             tt_gathered_stats = ttnn.all_gather(
                 tt_stats,
@@ -139,6 +155,7 @@ class RMSNorm(nn.Module):
                 weight=self.tt_weight,
                 dtype=ttnn.bfloat16,
                 stats=tt_gathered_stats,
+                compute_kernel_config=self.compute_kernel_config,
             )
             ttnn.deallocate(tt_gathered_stats)
             return tt_output
@@ -167,10 +184,12 @@ class RMSNorm(nn.Module):
                     x,
                     weight=self.tt_weight,
                     epsilon=self.eps,
+                    compute_kernel_config=self.compute_kernel_config,
                 )
             else:
                 tt_output = ttnn.rms_norm(
                     x,
                     epsilon=self.eps,
+                    compute_kernel_config=self.compute_kernel_config,
                 )
             return tt_output
