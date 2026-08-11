@@ -55,6 +55,9 @@ from models.demos.gemma4.utils.substate import substate
 PLI_PROJECTION_COMPUTE_PROFILE_ENV = "GEMMA4_PLI_PROJECTION_COMPUTE_PROFILE"
 PLI_PROJECTION_LAYER0_HIFI3_FP32_ACC_PROFILE = "layer0_hifi3_fp32_acc"
 PLI_PROJECTION_COMPUTE_PROFILES = frozenset({PLI_PROJECTION_LAYER0_HIFI3_FP32_ACC_PROFILE})
+MLP_RESIDUAL_ADD_PROFILE_ENV = "GEMMA4_MLP_RESIDUAL_ADD_COMPUTE_PROFILE"
+MLP_RESIDUAL_ADD_LAYER38_DECODE_FP32_INPUTS_BF16_OUTPUT_PROFILE = "layer38_decode_fp32_inputs_bf16_output"
+MLP_RESIDUAL_ADD_PROFILES = frozenset({MLP_RESIDUAL_ADD_LAYER38_DECODE_FP32_INPUTS_BF16_OUTPUT_PROFILE})
 
 
 def _pli_projection_compute_kernel_config(hidden_states, layer_idx):
@@ -78,6 +81,30 @@ def _pli_projection_compute_kernel_config(hidden_states, layer_idx):
         fp32_dest_acc_en=True,
         packer_l1_acc=False,
     )
+
+
+def _apply_mlp_residual_add(residual, hidden_states, layer_idx, is_decode):
+    """Apply the opt-in layer-38 decode residual-add fidelity profile."""
+    profile = os.environ.get(MLP_RESIDUAL_ADD_PROFILE_ENV) or None
+    if profile is None:
+        return ttnn.add(residual, hidden_states)
+    if profile not in MLP_RESIDUAL_ADD_PROFILES:
+        supported = ", ".join(sorted(MLP_RESIDUAL_ADD_PROFILES))
+        raise ValueError(f"{MLP_RESIDUAL_ADD_PROFILE_ENV} must be one of: " f"{supported}; got {profile!r}")
+    if layer_idx != 38 or not is_decode:
+        return ttnn.add(residual, hidden_states)
+
+    residual_fp32 = None
+    hidden_states_fp32 = None
+    try:
+        residual_fp32 = ttnn.typecast(residual, ttnn.float32)
+        hidden_states_fp32 = ttnn.typecast(hidden_states, ttnn.float32)
+        return ttnn.add(residual_fp32, hidden_states_fp32, dtype=ttnn.bfloat16)
+    finally:
+        if hidden_states_fp32 is not None:
+            hidden_states_fp32.deallocate(True)
+        if residual_fp32 is not None:
+            residual_fp32.deallocate(True)
 
 
 class Gemma4DecoderLayer:
@@ -376,7 +403,7 @@ class Gemma4DecoderLayer:
         # post_feedforward_layernorm -> residual add
         hidden_states = self.post_feedforward_layernorm.forward(hidden_states)
         self._capture_mlp_boundary("post_feedforward_norm", hidden_states)
-        combined = ttnn.add(residual, hidden_states)
+        combined = _apply_mlp_residual_add(residual, hidden_states, self.layer_idx, is_decode)
         residual.deallocate(True)
         hidden_states.deallocate(True)
 
