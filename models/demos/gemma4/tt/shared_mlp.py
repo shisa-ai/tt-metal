@@ -258,6 +258,14 @@ def _prefill_down_program_config(mesh_device, intermediate_size, hidden_size, in
 
 
 class SharedMLP:
+    BOUNDARY_CAPTURE_NAMES = (
+        "gate_projection",
+        "up_projection",
+        "gate_gelu",
+        "gated_product",
+        "down_projection",
+    )
+
     def __init__(
         self,
         mesh_device,
@@ -395,6 +403,12 @@ class SharedMLP:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
+    def _capture_boundary(self, boundary_name, value):
+        """Synchronously expose an opt-in dense-MLP diagnostic boundary."""
+        callback = getattr(self, "_boundary_capture_callback", None)
+        if callback is not None:
+            callback(boundary_name, value)
+
     def __call__(self, hidden_states):
         """
         GeGLU MLP forward with TP support.
@@ -422,6 +436,7 @@ class SharedMLP:
                 self.gate_proj,
                 program_config=gate_up_program_config,
             )
+        self._capture_boundary("gate_projection", gate)
 
         # up = x @ up_proj
         if gate_up_program_config is None:
@@ -432,6 +447,7 @@ class SharedMLP:
                 self.up_proj,
                 program_config=gate_up_program_config,
             )
+        self._capture_boundary("up_projection", up)
 
         if self.fuse_gate_gelu_mul:
             hidden = ttnn.mul(
@@ -443,7 +459,9 @@ class SharedMLP:
             # Gemma 4's GeGLU is numerically sensitive across layers and decode
             # steps; FastLut drift can change greedy token selection.
             gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+            self._capture_boundary("gate_gelu", gate)
             hidden = ttnn.mul(gate, up)
+        self._capture_boundary("gated_product", hidden)
         gate.deallocate(True)
         up.deallocate(True)
 
@@ -452,6 +470,7 @@ class SharedMLP:
             output = ttnn.linear(hidden, self.down_proj)
         else:
             output = ttnn.linear(hidden, self.down_proj, program_config=down_program_config)
+        self._capture_boundary("down_projection", output)
         hidden.deallocate(True)
 
         # Allreduce after row-parallel down_proj

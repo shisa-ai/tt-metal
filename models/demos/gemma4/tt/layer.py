@@ -89,6 +89,12 @@ class Gemma4DecoderLayer:
         "pre_layer_scalar",
         "layer_output",
     )
+    MLP_BOUNDARY_CAPTURE_NAMES = (
+        "pre_mlp_norm",
+        *SharedMLP.BOUNDARY_CAPTURE_NAMES,
+        "post_feedforward_norm",
+        "post_mlp_residual",
+    )
 
     def __init__(
         self,
@@ -243,6 +249,12 @@ class Gemma4DecoderLayer:
         if callback is not None:
             callback(self.layer_idx, boundary_name, hidden_states)
 
+    def _capture_mlp_boundary(self, boundary_name, value):
+        """Synchronously expose an opt-in layer-local MLP boundary."""
+        callback = getattr(self, "_mlp_boundary_capture_callback", None)
+        if callback is not None:
+            callback(self.layer_idx, boundary_name, value)
+
     def __call__(
         self,
         hidden_states,
@@ -331,6 +343,7 @@ class Gemma4DecoderLayer:
         # 2. MLP + MoE block
         residual = hidden_states
         normed = self.pre_feedforward_layernorm.forward(hidden_states)
+        self._capture_mlp_boundary("pre_mlp_norm", normed)
         mlp_output = self.shared_mlp(normed)
         normed.deallocate(True)
 
@@ -361,11 +374,13 @@ class Gemma4DecoderLayer:
 
         # post_feedforward_layernorm -> residual add
         hidden_states = self.post_feedforward_layernorm.forward(hidden_states)
+        self._capture_mlp_boundary("post_feedforward_norm", hidden_states)
         combined = ttnn.add(residual, hidden_states)
         residual.deallocate(True)
         hidden_states.deallocate(True)
 
         hidden_states = combined
+        self._capture_mlp_boundary("post_mlp_residual", hidden_states)
         self._capture_boundary("post_mlp_residual", hidden_states)
 
         # Per-layer input embeddings (E2B/E4B) — BEFORE layer_scalar (matching HF order)
