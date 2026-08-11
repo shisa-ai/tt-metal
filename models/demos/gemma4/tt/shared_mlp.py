@@ -22,7 +22,13 @@ from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 DOWN_PROJ_COMPUTE_PROFILE_ENV = "GEMMA4_SHARED_MLP_DOWN_PROJ_COMPUTE_PROFILE"
 DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE = "layer38_hifi3_fp32_acc"
-DOWN_PROJ_COMPUTE_PROFILES = frozenset({DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE})
+DOWN_PROJ_LAYER38_HIFI3_FP32_L1_ACC_PROFILE = "layer38_hifi3_fp32_l1_acc"
+DOWN_PROJ_COMPUTE_PROFILES = frozenset(
+    {
+        DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE,
+        DOWN_PROJ_LAYER38_HIFI3_FP32_L1_ACC_PROFILE,
+    }
+)
 
 
 def _down_proj_compute_kernel_config(hidden_states, layer_idx):
@@ -43,7 +49,7 @@ def _down_proj_compute_kernel_config(hidden_states, layer_idx):
         math_fidelity=ttnn.MathFidelity.HiFi3,
         math_approx_mode=False,
         fp32_dest_acc_en=True,
-        packer_l1_acc=False,
+        packer_l1_acc=profile == DOWN_PROJ_LAYER38_HIFI3_FP32_L1_ACC_PROFILE,
     )
 
 
