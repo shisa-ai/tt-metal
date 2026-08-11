@@ -21,6 +21,7 @@ from models.demos.gemma4.tt.ccl import ccl_allreduce
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 DOWN_PROJ_COMPUTE_PROFILE_ENV = "GEMMA4_SHARED_MLP_DOWN_PROJ_COMPUTE_PROFILE"
+DOWN_PROJ_PROGRAM_PROFILE_ENV = "GEMMA4_SHARED_MLP_DOWN_PROJ_PROGRAM_PROFILE"
 DOWN_PROJ_LAYER38_HIFI2_FP32_ACC_PROFILE = "layer38_hifi2_fp32_acc"
 DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE = "layer38_hifi3_fp32_acc"
 DOWN_PROJ_LAYER38_HIFI3_FP32_L1_ACC_PROFILE = "layer38_hifi3_fp32_l1_acc"
@@ -38,6 +39,9 @@ DOWN_PROJ_COMPUTE_PROFILE_SPECS = {
     DOWN_PROJ_LAYER38_LOFI_BF16_L1_ACC_PROFILE: (ttnn.MathFidelity.LoFi, False, True),
 }
 DOWN_PROJ_COMPUTE_PROFILES = frozenset(DOWN_PROJ_COMPUTE_PROFILE_SPECS)
+DOWN_PROJ_LAYER38_DECODE_MCAST1D_W8_PROFILE = "layer38_decode_mcast1d_w8"
+DOWN_PROJ_PROGRAM_PROFILES = frozenset({DOWN_PROJ_LAYER38_DECODE_MCAST1D_W8_PROFILE})
+DOWN_PROJ_LAYER38_DECODE_INPUT_SHAPE = (1, 1, 1, 10240)
 
 
 def _down_proj_compute_kernel_config(hidden_states, layer_idx):
@@ -63,11 +67,45 @@ def _down_proj_compute_kernel_config(hidden_states, layer_idx):
     )
 
 
+def _down_proj_program_config(hidden_states, layer_idx):
+    """Return the exact-shape opt-in layer-38 decode program, if selected."""
+    profile = os.environ.get(DOWN_PROJ_PROGRAM_PROFILE_ENV) or None
+    if profile is None:
+        return None
+    if profile not in DOWN_PROJ_PROGRAM_PROFILES:
+        supported = ", ".join(sorted(DOWN_PROJ_PROGRAM_PROFILES))
+        raise ValueError(f"{DOWN_PROJ_PROGRAM_PROFILE_ENV} must be one of: {supported}")
+    if layer_idx != 38 or tuple(hidden_states.shape) != DOWN_PROJ_LAYER38_DECODE_INPUT_SHAPE:
+        return None
+    device = hidden_states.device()
+    if device is None:
+        raise ValueError(f"{DOWN_PROJ_PROGRAM_PROFILE_ENV}={profile} requires a device-resident activation")
+    grid = device.compute_with_storage_grid_size()
+    if (grid.x, grid.y) != (8, 9):
+        raise ValueError(f"{DOWN_PROJ_PROGRAM_PROFILE_ENV}={profile} requires an 8x9 compute grid")
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+        in0_block_w=8,
+        out_subblock_h=1,
+        out_subblock_w=2,
+        out_block_h=1,
+        out_block_w=2,
+        per_core_M=1,
+        per_core_N=2,
+        fuse_batch=True,
+        fused_activation=None,
+        mcast_in0=True,
+    )
+
+
 def _apply_down_projection(hidden_states, weight, layer_idx):
     kwargs = {}
     compute_kernel_config = _down_proj_compute_kernel_config(hidden_states, layer_idx)
     if compute_kernel_config is not None:
         kwargs["compute_kernel_config"] = compute_kernel_config
+    program_config = _down_proj_program_config(hidden_states, layer_idx)
+    if program_config is not None:
+        kwargs["program_config"] = program_config
     return ttnn.linear(hidden_states, weight, **kwargs)
 
 
