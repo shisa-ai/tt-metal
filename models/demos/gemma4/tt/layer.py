@@ -81,6 +81,15 @@ def _pli_projection_compute_kernel_config(hidden_states, layer_idx):
 
 
 class Gemma4DecoderLayer:
+    BOUNDARY_CAPTURE_NAMES = (
+        "layer_input",
+        "post_attention_residual",
+        "post_mlp_residual",
+        "post_pli_residual",
+        "pre_layer_scalar",
+        "layer_output",
+    )
+
     def __init__(
         self,
         mesh_device,
@@ -222,6 +231,18 @@ class Gemma4DecoderLayer:
             )
             self.post_per_layer_input_norm = _norm("post_per_layer_input_norm")
 
+    def _capture_boundary(self, boundary_name, hidden_states):
+        """Synchronously expose an opt-in diagnostic boundary.
+
+        Normal execution never installs ``_boundary_capture_callback`` and
+        therefore only pays the attribute lookup. A diagnostic callback must
+        copy any tensor it needs before returning because later operations may
+        reuse or deallocate the underlying device storage.
+        """
+        callback = getattr(self, "_boundary_capture_callback", None)
+        if callback is not None:
+            callback(self.layer_idx, boundary_name, hidden_states)
+
     def __call__(
         self,
         hidden_states,
@@ -262,6 +283,8 @@ class Gemma4DecoderLayer:
         Returns:
             hidden_states: [1, 1, seq_len, hidden_size] on device
         """
+        self._capture_boundary("layer_input", hidden_states)
+
         # 1. Attention block: norm -> attn -> post_attn_norm -> residual add
         residual = hidden_states
         normed = self.input_layernorm.forward(hidden_states)
@@ -303,6 +326,8 @@ class Gemma4DecoderLayer:
             residual.deallocate(True)
             attn_output.deallocate(True)
 
+        self._capture_boundary("post_attention_residual", hidden_states)
+
         # 2. MLP + MoE block
         residual = hidden_states
         normed = self.pre_feedforward_layernorm.forward(hidden_states)
@@ -341,6 +366,7 @@ class Gemma4DecoderLayer:
         hidden_states.deallocate(True)
 
         hidden_states = combined
+        self._capture_boundary("post_mlp_residual", hidden_states)
 
         # Per-layer input embeddings (E2B/E4B) — BEFORE layer_scalar (matching HF order)
         if self.hidden_size_per_layer_input and per_layer_input is not None and hasattr(self, "per_layer_input_gate"):
@@ -358,8 +384,13 @@ class Gemma4DecoderLayer:
             if len(hidden_states.shape) > 4:
                 hidden_states = ttnn.reshape(hidden_states, (1, 1, hidden_states.shape[-2], self.hidden_size))
 
+        self._capture_boundary("post_pli_residual", hidden_states)
+        self._capture_boundary("pre_layer_scalar", hidden_states)
+
         # Layer scalar — AFTER PLI (matching HF order)
         if self.layer_scalar != 1.0:
             hidden_states = ttnn.mul(hidden_states, self.layer_scalar)
+
+        self._capture_boundary("layer_output", hidden_states)
 
         return hidden_states
