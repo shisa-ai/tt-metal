@@ -20,6 +20,14 @@ from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 
 class SharedMLP:
+    BOUNDARY_CAPTURE_NAMES = (
+        "gate_projection",
+        "gate_gelu",
+        "up_projection",
+        "gated_product",
+        "down_projection",
+    )
+
     def __init__(
         self,
         mesh_device,
@@ -93,6 +101,12 @@ class SharedMLP:
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
 
+    def _capture_boundary(self, boundary_name, value):
+        """Synchronously expose an opt-in dense-MLP diagnostic boundary."""
+        callback = getattr(self, "_boundary_capture_callback", None)
+        if callback is not None:
+            callback(boundary_name, value)
+
     def __call__(self, hidden_states):
         """
         GeGLU MLP forward with TP support.
@@ -101,20 +115,25 @@ class SharedMLP:
         """
         # gate = GELU(x @ gate_proj)
         gate = ttnn.linear(hidden_states, self.gate_proj)
+        self._capture_boundary("gate_projection", gate)
         # Gemma 4's GeGLU is numerically sensitive across layers and decode
         # steps; FastLut drift can change greedy token selection.
         gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+        self._capture_boundary("gate_gelu", gate)
 
         # up = x @ up_proj
         up = ttnn.linear(hidden_states, self.up_proj)
+        self._capture_boundary("up_projection", up)
 
         # hidden = gate * up
         hidden = ttnn.mul(gate, up)
+        self._capture_boundary("gated_product", hidden)
         gate.deallocate(True)
         up.deallocate(True)
 
         # output = hidden @ down_proj
         output = ttnn.linear(hidden, self.down_proj)
+        self._capture_boundary("down_projection", output)
         hidden.deallocate(True)
 
         # Allreduce after row-parallel down_proj
