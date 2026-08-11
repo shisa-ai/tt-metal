@@ -258,14 +258,23 @@ def _prefill_down_program_config(mesh_device, intermediate_size, hidden_size, in
 
 
 DOWN_PROJ_COMPUTE_PROFILE_ENV = "GEMMA4_SHARED_MLP_DOWN_PROJ_COMPUTE_PROFILE"
+DOWN_PROJ_LAYER38_HIFI2_FP32_ACC_PROFILE = "layer38_hifi2_fp32_acc"
 DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE = "layer38_hifi3_fp32_acc"
 DOWN_PROJ_LAYER38_HIFI3_FP32_L1_ACC_PROFILE = "layer38_hifi3_fp32_l1_acc"
-DOWN_PROJ_COMPUTE_PROFILES = frozenset(
-    {
-        DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE,
-        DOWN_PROJ_LAYER38_HIFI3_FP32_L1_ACC_PROFILE,
-    }
-)
+DOWN_PROJ_LAYER38_HIFI4_BF16_L1_ACC_PROFILE = "layer38_hifi4_bf16_l1_acc"
+DOWN_PROJ_LAYER38_HIFI3_BF16_L1_ACC_PROFILE = "layer38_hifi3_bf16_l1_acc"
+DOWN_PROJ_LAYER38_LOFI_FP32_ACC_PROFILE = "layer38_lofi_fp32_acc"
+DOWN_PROJ_LAYER38_LOFI_BF16_L1_ACC_PROFILE = "layer38_lofi_bf16_l1_acc"
+DOWN_PROJ_COMPUTE_PROFILE_SPECS = {
+    DOWN_PROJ_LAYER38_HIFI2_FP32_ACC_PROFILE: (ttnn.MathFidelity.HiFi2, True, False),
+    DOWN_PROJ_LAYER38_HIFI3_FP32_ACC_PROFILE: (ttnn.MathFidelity.HiFi3, True, False),
+    DOWN_PROJ_LAYER38_HIFI3_FP32_L1_ACC_PROFILE: (ttnn.MathFidelity.HiFi3, True, True),
+    DOWN_PROJ_LAYER38_HIFI4_BF16_L1_ACC_PROFILE: (ttnn.MathFidelity.HiFi4, False, True),
+    DOWN_PROJ_LAYER38_HIFI3_BF16_L1_ACC_PROFILE: (ttnn.MathFidelity.HiFi3, False, True),
+    DOWN_PROJ_LAYER38_LOFI_FP32_ACC_PROFILE: (ttnn.MathFidelity.LoFi, True, False),
+    DOWN_PROJ_LAYER38_LOFI_BF16_L1_ACC_PROFILE: (ttnn.MathFidelity.LoFi, False, True),
+}
+DOWN_PROJ_COMPUTE_PROFILES = frozenset(DOWN_PROJ_COMPUTE_PROFILE_SPECS)
 
 
 def _down_proj_compute_kernel_config(hidden_states, layer_idx):
@@ -281,12 +290,13 @@ def _down_proj_compute_kernel_config(hidden_states, layer_idx):
     device = hidden_states.device()
     if device is None:
         raise ValueError(f"{DOWN_PROJ_COMPUTE_PROFILE_ENV}={profile} requires a " "device-resident activation")
+    math_fidelity, fp32_dest_acc_en, packer_l1_acc = DOWN_PROJ_COMPUTE_PROFILE_SPECS[profile]
     return ttnn.init_device_compute_kernel_config(
         device.arch(),
-        math_fidelity=ttnn.MathFidelity.HiFi3,
+        math_fidelity=math_fidelity,
         math_approx_mode=False,
-        fp32_dest_acc_en=True,
-        packer_l1_acc=profile == DOWN_PROJ_LAYER38_HIFI3_FP32_L1_ACC_PROFILE,
+        fp32_dest_acc_en=fp32_dest_acc_en,
+        packer_l1_acc=packer_l1_acc,
     )
 
 
