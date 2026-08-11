@@ -47,6 +47,26 @@ from models.demos.gemma4.utils.substate import substate
 # so it is profiled there / by op name (SamplingDeviceOperation, TopK).
 LM_HEAD_SIGNPOST = "gemma4_lm_head"
 LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE = TP1_LM_HEAD_DRAM_SHARD_DEFAULT_CHUNK_SIZE
+LM_HEAD_COMPUTE_PROFILE_ENV = "GEMMA4_LM_HEAD_COMPUTE_PROFILE"
+LM_HEAD_HIFI3_FP32_ACC_PROFILE = "hifi3_fp32_acc"
+LM_HEAD_COMPUTE_PROFILES = frozenset({LM_HEAD_HIFI3_FP32_ACC_PROFILE})
+
+
+def _get_tp1_dram_sharded_lm_head_compute_kernel_config(mesh_device):
+    """Build the stock or explicitly selected TP1 LM-head compute profile."""
+    profile = os.environ.get(LM_HEAD_COMPUTE_PROFILE_ENV) or None
+    if profile is not None and profile not in LM_HEAD_COMPUTE_PROFILES:
+        supported = ", ".join(sorted(LM_HEAD_COMPUTE_PROFILES))
+        raise ValueError(f"{LM_HEAD_COMPUTE_PROFILE_ENV} must be one of: {supported}; got {profile!r}")
+
+    use_hifi3_fp32 = profile == LM_HEAD_HIFI3_FP32_ACC_PROFILE
+    return ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(),
+        math_fidelity=ttnn.MathFidelity.HiFi3 if use_hifi3_fp32 else ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=use_hifi3_fp32,
+        packer_l1_acc=not use_hifi3_fp32,
+    )
 
 
 def _create_lm_head_dram_sharded_weight_config(mesh_device, k: int, n: int):
@@ -435,13 +455,7 @@ class Gemma4Model:
                     chunk_size,
                     lm_head_core_grid.num_cores,
                 )
-                self.lm_head_compute_kernel_config = ttnn.init_device_compute_kernel_config(
-                    mesh_device.arch(),
-                    math_fidelity=ttnn.MathFidelity.HiFi2,
-                    math_approx_mode=False,
-                    fp32_dest_acc_en=False,
-                    packer_l1_acc=True,
-                )
+                self.lm_head_compute_kernel_config = _get_tp1_dram_sharded_lm_head_compute_kernel_config(mesh_device)
                 self.lm_head_weight = None
                 logger.info(
                     f"TP1 LM head: {len(self.lm_head_dram_sharded_weights)} x {chunk_size}-column "
