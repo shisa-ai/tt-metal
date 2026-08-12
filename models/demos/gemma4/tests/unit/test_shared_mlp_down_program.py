@@ -166,6 +166,7 @@ def test_down_program_applies_only_to_target_phase(monkeypatch, sequence_length,
     monkeypatch.setattr(shared_mlp.ttnn, "mul", lambda lhs, rhs, **kwargs: hidden)
 
     mlp = object.__new__(shared_mlp.SharedMLP)
+    mlp.layer_idx = None
     mlp.fuse_gate_gelu_mul = False
     mlp.decode_gate_up_program_config = None
     mlp.prefill_gate_up_program_config = None
