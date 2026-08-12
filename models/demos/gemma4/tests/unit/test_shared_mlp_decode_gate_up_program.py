@@ -57,6 +57,36 @@ def test_decode_width_selector_reads_environment(monkeypatch):
     assert shared_mlp._resolve_decode_gate_up_in0_block_w(2560) == 10
 
 
+def test_prefill_widths_exclude_chotto_k_blocks_that_exceed_l1():
+    assert shared_mlp._prefill_gate_up_in0_block_widths(2560) == (1, 2, 4)
+
+
+def test_prefill_widths_reject_unqualified_hidden_size(expect_error):
+    with expect_error(ValueError, "hidden_size=2560"):
+        shared_mlp._prefill_gate_up_in0_block_widths(2816)
+
+
+@pytest.mark.parametrize("value", [1, "2", " 4 "])
+def test_prefill_width_selector_accepts_safe_explicit_widths(value):
+    assert shared_mlp._resolve_prefill_gate_up_in0_block_w(2560, value) == int(value)
+
+
+@pytest.mark.parametrize("value", [0, "0"])
+def test_prefill_width_selector_zero_disables_program(value):
+    assert shared_mlp._resolve_prefill_gate_up_in0_block_w(2560, value) is None
+
+
+@pytest.mark.parametrize("value", [True, False, "auto", -1, 3, 5, 8])
+def test_prefill_width_selector_rejects_implicit_or_l1_unsafe_values(expect_error, value):
+    with expect_error(ValueError, shared_mlp.PREFILL_GATE_UP_IN0_BLOCK_W_ENV):
+        shared_mlp._resolve_prefill_gate_up_in0_block_w(2560, value)
+
+
+def test_prefill_width_selector_reads_environment(monkeypatch):
+    monkeypatch.setenv(shared_mlp.PREFILL_GATE_UP_IN0_BLOCK_W_ENV, "4")
+    assert shared_mlp._resolve_prefill_gate_up_in0_block_w(2560) == 4
+
+
 def test_decode_config_uses_explicit_safe_blocking(monkeypatch):
     captured = {}
     monkeypatch.setattr(shared_mlp.ttnn, "CoreCoord", lambda x, y: (x, y))
@@ -88,16 +118,73 @@ def test_decode_config_uses_explicit_safe_blocking(monkeypatch):
     }
 
 
-@pytest.mark.parametrize("decode", [False, True])
-def test_program_config_applies_only_to_decode_gate_up(monkeypatch, decode):
+def test_prefill_config_matches_accepted_automatic_geometry(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(shared_mlp.ttnn, "CoreCoord", lambda x, y: (x, y))
+    monkeypatch.setattr(
+        shared_mlp.ttnn,
+        "MatmulMultiCoreReuseMultiCastProgramConfig",
+        lambda **kwargs: captured.update(kwargs) or kwargs,
+    )
+    mesh = SimpleNamespace(compute_with_storage_grid_size=lambda: SimpleNamespace(x=8, y=9))
+
+    config = shared_mlp._prefill_gate_up_program_config(
+        mesh,
+        hidden_size=2560,
+        intermediate_size=10240,
+        in0_block_w=4,
+    )
+
+    assert config == captured
+    assert captured == {
+        "compute_with_storage_grid_size": (8, 9),
+        "in0_block_w": 4,
+        "out_subblock_h": 8,
+        "out_subblock_w": 1,
+        "per_core_M": 32,
+        "per_core_N": 5,
+        "transpose_mcast": False,
+        "fused_activation": None,
+        "fuse_batch": False,
+    }
+
+
+def test_prefill_config_rejects_non_wormhole_grid(expect_error):
+    mesh = SimpleNamespace(compute_with_storage_grid_size=lambda: SimpleNamespace(x=8, y=8))
+    with expect_error(ValueError, "8x9 grid"):
+        shared_mlp._prefill_gate_up_program_config(
+            mesh,
+            hidden_size=2560,
+            intermediate_size=10240,
+            in0_block_w=4,
+        )
+
+
+def test_prefill_config_rejects_unqualified_shape(expect_error):
+    mesh = SimpleNamespace(compute_with_storage_grid_size=lambda: SimpleNamespace(x=8, y=9))
+    with expect_error(ValueError, "intermediate_size=10240"):
+        shared_mlp._prefill_gate_up_program_config(
+            mesh,
+            hidden_size=2560,
+            intermediate_size=2112,
+            in0_block_w=4,
+        )
+
+
+@pytest.mark.parametrize(
+    ("sequence_length", "expected_config"),
+    [(32, "decode"), (1024, "prefill"), (128, None)],
+)
+def test_program_config_applies_only_to_target_phase(monkeypatch, sequence_length, expected_config):
     calls = []
-    shape = (1, 1, 32 if decode else 1024, 2560)
+    shape = (1, 1, sequence_length, 2560)
     hidden_states = FakeTensor("input", shape=shape)
     gate = FakeTensor("gate")
     up = FakeTensor("up")
     hidden = FakeTensor("hidden")
     output = FakeTensor("output")
-    decode_config = object()
+    decode_config = "decode"
+    prefill_config = "prefill"
 
     def linear(tensor, weight, program_config=None):
         calls.append((weight.name, program_config))
@@ -110,14 +197,14 @@ def test_program_config_applies_only_to_decode_gate_up(monkeypatch, decode):
     mlp = object.__new__(shared_mlp.SharedMLP)
     mlp.fuse_gate_gelu_mul = False
     mlp.decode_gate_up_program_config = decode_config
+    mlp.prefill_gate_up_program_config = prefill_config
     mlp.gate_proj = FakeTensor("gate_weight")
     mlp.up_proj = FakeTensor("up_weight")
     mlp.down_proj = FakeTensor("down_weight")
     mlp.mesh_config = SimpleNamespace(tp=1)
 
     assert mlp(hidden_states) is output
-    expected = decode_config if decode else None
-    assert calls == [("gate_weight", expected), ("up_weight", expected), ("down_weight", None)]
+    assert calls == [("gate_weight", expected_config), ("up_weight", expected_config), ("down_weight", None)]
 
 
 def test_fused_accurate_gelu_mul_removes_standalone_gelu(monkeypatch):
@@ -148,6 +235,7 @@ def test_fused_accurate_gelu_mul_removes_standalone_gelu(monkeypatch):
     mlp = object.__new__(shared_mlp.SharedMLP)
     mlp.fuse_gate_gelu_mul = True
     mlp.decode_gate_up_program_config = None
+    mlp.prefill_gate_up_program_config = None
     mlp.gate_proj = FakeTensor("gate_weight")
     mlp.up_proj = FakeTensor("up_weight")
     mlp.down_proj = FakeTensor("down_weight")
