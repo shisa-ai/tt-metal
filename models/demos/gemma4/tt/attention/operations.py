@@ -20,6 +20,13 @@ import os
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 
+from .prefill_qkv_config import (
+    PREFILL_SLIDING_QKV_HIDDEN_SIZE,
+    PREFILL_SLIDING_QKV_IN0_BLOCK_W_ENV,
+    PREFILL_SLIDING_QKV_OUTPUT_SIZE,
+    PREFILL_SLIDING_QKV_SEQUENCE_LENGTH,
+    resolve_prefill_sliding_qkv_in0_block_w,
+)
 from .weights import AttentionWeights
 
 # Non-chunked prefill SDPA silently returns WRONG results once the Q sequence
@@ -42,6 +49,49 @@ PREFILL_SLIDING_CHUNK_SIZE = int(os.environ.get("GEMMA4_PREFILL_SLIDING_CHUNK_SI
 QKV_COMPUTE_PROFILE_ENV = "GEMMA4_QKV_COMPUTE_PROFILE"
 QKV_HIFI3_FP32_ACC_PROFILE = "hifi3_fp32_acc"
 QKV_COMPUTE_PROFILES = frozenset({QKV_HIFI3_FP32_ACC_PROFILE})
+
+
+def _prefill_sliding_qkv_program_config(hidden_states, weights):
+    """Build the accepted ISL-1024 sliding-QKV geometry with explicit K blocking."""
+    in0_block_w = resolve_prefill_sliding_qkv_in0_block_w()
+    if in0_block_w is None or weights.is_global:
+        return None
+
+    sequence_length = int(hidden_states.shape[-2])
+    if sequence_length != PREFILL_SLIDING_QKV_SEQUENCE_LENGTH:
+        return None
+    hidden_size = int(hidden_states.shape[-1])
+    weight_k = int(weights.wqkv.shape[-2])
+    output_size = int(weights.wqkv.shape[-1])
+    if (
+        hidden_size != PREFILL_SLIDING_QKV_HIDDEN_SIZE
+        or weight_k != PREFILL_SLIDING_QKV_HIDDEN_SIZE
+        or output_size != PREFILL_SLIDING_QKV_OUTPUT_SIZE
+    ):
+        raise ValueError(
+            f"{PREFILL_SLIDING_QKV_IN0_BLOCK_W_ENV} requires the Chotto TP1 "
+            f"M={PREFILL_SLIDING_QKV_SEQUENCE_LENGTH}, "
+            f"K={PREFILL_SLIDING_QKV_HIDDEN_SIZE}, "
+            f"N={PREFILL_SLIDING_QKV_OUTPUT_SIZE} sliding-QKV shape"
+        )
+
+    device = hidden_states.device()
+    if device is None:
+        raise ValueError(f"{PREFILL_SLIDING_QKV_IN0_BLOCK_W_ENV} requires a device-resident activation")
+    grid = device.compute_with_storage_grid_size()
+    if (grid.x, grid.y) != (8, 9):
+        raise ValueError(f"{PREFILL_SLIDING_QKV_IN0_BLOCK_W_ENV} requires an 8x9 grid, got {grid.x}x{grid.y}")
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+        in0_block_w=in0_block_w,
+        out_subblock_h=4,
+        out_subblock_w=2,
+        per_core_M=4,
+        per_core_N=12,
+        transpose_mcast=False,
+        fused_activation=None,
+        fuse_batch=False,
+    )
 
 
 def _qkv_compute_kernel_config(hidden_states):
@@ -80,6 +130,9 @@ def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config
     kwargs = {"memory_config": memory_config}
     if compute_kernel_config is not None:
         kwargs["compute_kernel_config"] = compute_kernel_config
+    program_config = _prefill_sliding_qkv_program_config(hidden_states, weights)
+    if program_config is not None:
+        kwargs["program_config"] = program_config
     return ttnn.linear(hidden_states, weights.wqkv, **kwargs)
 
 
