@@ -126,3 +126,45 @@ def test_prefill_sliding_qkv_program_matches_accepted_geometry(monkeypatch):
             },
         )
     ]
+
+
+def test_prefill_sliding_output_program_matches_accepted_geometry(monkeypatch):
+    monkeypatch.setenv(operations.PREFILL_SLIDING_OUTPUT_IN0_BLOCK_W_ENV, "8")
+    linear_calls = []
+    monkeypatch.setattr(ttnn, "CoreCoord", lambda x, y: (x, y))
+    monkeypatch.setattr(
+        ttnn,
+        "MatmulMultiCoreReuseMultiCastProgramConfig",
+        lambda **kwargs: kwargs,
+    )
+    monkeypatch.setattr(
+        ttnn,
+        "linear",
+        lambda *args, **kwargs: linear_calls.append((args, kwargs)) or "output",
+    )
+
+    activation = _FakeActivation(_FakeDevice(), shape=(1, 1, 1024, 2048))
+    weights = SimpleNamespace(
+        o_proj=SimpleNamespace(shape=(1, 1, 2048, 2560)),
+        is_global=False,
+    )
+
+    assert operations.apply_output_projection(activation, weights) == "output"
+    assert linear_calls == [
+        (
+            (activation, weights.o_proj),
+            {
+                "program_config": {
+                    "compute_with_storage_grid_size": (8, 9),
+                    "in0_block_w": 8,
+                    "out_subblock_h": 4,
+                    "out_subblock_w": 2,
+                    "per_core_M": 4,
+                    "per_core_N": 10,
+                    "transpose_mcast": False,
+                    "fused_activation": None,
+                    "fuse_batch": False,
+                }
+            },
+        )
+    ]
