@@ -14,27 +14,9 @@ HF weight shapes:
   down_proj.weight: [hidden_size, intermediate_size] = [2816, 2112]
 """
 
-import os
-
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
-
-FUSED_GATE_GELU_ENV = "GEMMA4_FUSED_SHARED_MLP_GATE_GELU"
-
-
-def _resolve_fused_gate_gelu(value=None):
-    """Resolve the bounded gate/GELU fusion selector without changing the default."""
-    if value is None:
-        value = os.environ.get(FUSED_GATE_GELU_ENV, "0")
-    if isinstance(value, bool):
-        return value
-    normalized = str(value).strip().lower()
-    if normalized in ("0", "false", "no", "off"):
-        return False
-    if normalized in ("1", "true", "yes", "on"):
-        return True
-    raise ValueError(f"{FUSED_GATE_GELU_ENV} must be a boolean value, got {value!r}")
 
 
 class SharedMLP:
@@ -47,7 +29,6 @@ class SharedMLP:
         ccl_manager=None,
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
-        fuse_gate_gelu=None,
     ):
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
@@ -57,9 +38,6 @@ class SharedMLP:
 
         tp = mesh_config.tp if mesh_config else 1
         tp_suffix = f"_tp{tp}" if tp > 1 else ""
-        self.fuse_gate_gelu = _resolve_fused_gate_gelu(fuse_gate_gelu)
-        if self.fuse_gate_gelu and tp != 1:
-            raise ValueError(f"{FUSED_GATE_GELU_ENV} is currently qualified only for TP1")
 
         # Tag the cache filenames with the weight dtype so that flipping a
         # SharedMLP weight's dtype (e.g. bf16 → bfp8 for DRAM-pressure relief)
@@ -122,19 +100,10 @@ class SharedMLP:
         gate/up are column-parallel, down is row-parallel + allreduce.
         """
         # gate = GELU(x @ gate_proj)
-        if self.fuse_gate_gelu:
-            # Param 0 selects the accurate fused GELU kernel; nonzero selects
-            # FastLut. Quality still requires the full model-level gate.
-            gate = ttnn.linear(
-                hidden_states,
-                self.gate_proj,
-                activation=ttnn.UnaryWithParam(ttnn.UnaryOpType.GELU, 0.0),
-            )
-        else:
-            gate = ttnn.linear(hidden_states, self.gate_proj)
-            # Gemma 4's GeGLU is numerically sensitive across layers and decode
-            # steps; FastLut drift can change greedy token selection.
-            gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+        gate = ttnn.linear(hidden_states, self.gate_proj)
+        # Gemma 4's GeGLU is numerically sensitive across layers and decode
+        # steps; FastLut drift can change greedy token selection.
+        gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
 
         # up = x @ up_proj
         up = ttnn.linear(hidden_states, self.up_proj)
