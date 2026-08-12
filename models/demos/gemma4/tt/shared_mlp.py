@@ -22,7 +22,12 @@ from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 FUSED_GATE_GELU_MUL_ENV = "GEMMA4_FUSED_SHARED_MLP_GATE_GELU_MUL"
 DECODE_GATE_UP_IN0_BLOCK_W_ENV = "GEMMA4_DECODE_SHARED_MLP_GATE_UP_IN0_BLOCK_W"
+PREFILL_GATE_UP_IN0_BLOCK_W_ENV = "GEMMA4_PREFILL_SHARED_MLP_GATE_UP_IN0_BLOCK_W"
 MAX_EXPERIMENTAL_IN0_BLOCK_W = 32
+MAX_PREFILL_IN0_BLOCK_W = 4
+PREFILL_PROGRAM_HIDDEN_SIZE = 2560
+PREFILL_PROGRAM_INTERMEDIATE_SIZE = 10240
+PREFILL_PROGRAM_SEQUENCE_LENGTH = 1024
 
 
 def _resolve_bool_env(name, value=None):
@@ -64,6 +69,37 @@ def _resolve_decode_gate_up_in0_block_w(hidden_size, value=None):
     return width
 
 
+def _prefill_gate_up_in0_block_widths(hidden_size):
+    """Return shape-legal widths that fit the frozen Wormhole prefill L1 budget."""
+    if hidden_size != PREFILL_PROGRAM_HIDDEN_SIZE:
+        raise ValueError(
+            f"experimental prefill gate/up program requires hidden_size={PREFILL_PROGRAM_HIDDEN_SIZE}, "
+            f"got {hidden_size}"
+        )
+    # For the frozen M=32/N=5 geometry, width 4 consumes 1,261,568 of
+    # 1,391,936 CB-usable bytes; the next divisor, width 5, needs 1,413,120.
+    return tuple(width for width in _decode_gate_up_in0_block_widths(hidden_size) if width <= MAX_PREFILL_IN0_BLOCK_W)
+
+
+def _resolve_prefill_gate_up_in0_block_w(hidden_size, value=None):
+    if value is None:
+        value = os.environ.get(PREFILL_GATE_UP_IN0_BLOCK_W_ENV, "0")
+    if isinstance(value, bool):
+        raise ValueError(f"{PREFILL_GATE_UP_IN0_BLOCK_W_ENV} requires an explicit integer width, got {value!r}")
+    try:
+        width = int(str(value).strip())
+    except ValueError as error:
+        raise ValueError(f"{PREFILL_GATE_UP_IN0_BLOCK_W_ENV} requires an integer width, got {value!r}") from error
+    if width == 0:
+        return None
+    widths = _prefill_gate_up_in0_block_widths(hidden_size)
+    if width not in widths:
+        raise ValueError(
+            f"{PREFILL_GATE_UP_IN0_BLOCK_W_ENV} must be 0 or one of {widths} for hidden_size={hidden_size}, got {width}"
+        )
+    return width
+
+
 def _decode_gate_up_program_config(mesh_device, hidden_size, intermediate_size, in0_block_w):
     """Build an explicit TP1 decode program for a validated K-block width."""
     grid = mesh_device.compute_with_storage_grid_size()
@@ -84,6 +120,33 @@ def _decode_gate_up_program_config(mesh_device, hidden_size, intermediate_size, 
     )
 
 
+def _prefill_gate_up_program_config(mesh_device, hidden_size, intermediate_size, in0_block_w):
+    """Build the accepted automatic geometry with an explicit prefill K block."""
+    grid = mesh_device.compute_with_storage_grid_size()
+    if (grid.x, grid.y) != (8, 9):
+        raise ValueError(f"experimental prefill gate/up program requires an 8x9 grid, got {grid.x}x{grid.y}")
+    if (hidden_size, intermediate_size) != (PREFILL_PROGRAM_HIDDEN_SIZE, PREFILL_PROGRAM_INTERMEDIATE_SIZE):
+        raise ValueError(
+            "experimental prefill gate/up program requires "
+            f"hidden_size={PREFILL_PROGRAM_HIDDEN_SIZE} and intermediate_size={PREFILL_PROGRAM_INTERMEDIATE_SIZE}, "
+            f"got hidden_size={hidden_size} and intermediate_size={intermediate_size}"
+        )
+    n_tiles = intermediate_size // ttnn.TILE_SIZE
+    core_count = grid.x * grid.y
+    per_core_n = (n_tiles + core_count - 1) // core_count
+    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+        in0_block_w=in0_block_w,
+        out_subblock_h=8,
+        out_subblock_w=1,
+        per_core_M=PREFILL_PROGRAM_SEQUENCE_LENGTH // ttnn.TILE_SIZE,
+        per_core_N=per_core_n,
+        transpose_mcast=False,
+        fused_activation=None,
+        fuse_batch=False,
+    )
+
+
 class SharedMLP:
     def __init__(
         self,
@@ -96,6 +159,7 @@ class SharedMLP:
         tensor_cache_path=None,
         fuse_gate_gelu_mul=None,
         decode_gate_up_in0_block_w=None,
+        prefill_gate_up_in0_block_w=None,
     ):
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
@@ -109,7 +173,14 @@ class SharedMLP:
         self.decode_gate_up_in0_block_w = _resolve_decode_gate_up_in0_block_w(
             self.hidden_size, decode_gate_up_in0_block_w
         )
-        if (self.fuse_gate_gelu_mul or self.decode_gate_up_in0_block_w is not None) and tp != 1:
+        self.prefill_gate_up_in0_block_w = _resolve_prefill_gate_up_in0_block_w(
+            self.hidden_size, prefill_gate_up_in0_block_w
+        )
+        if (
+            self.fuse_gate_gelu_mul
+            or self.decode_gate_up_in0_block_w is not None
+            or self.prefill_gate_up_in0_block_w is not None
+        ) and tp != 1:
             raise ValueError("experimental shared-MLP selectors are currently qualified only for TP1")
         self.decode_gate_up_program_config = (
             _decode_gate_up_program_config(
@@ -119,6 +190,16 @@ class SharedMLP:
                 self.decode_gate_up_in0_block_w,
             )
             if self.decode_gate_up_in0_block_w is not None
+            else None
+        )
+        self.prefill_gate_up_program_config = (
+            _prefill_gate_up_program_config(
+                mesh_device,
+                self.hidden_size,
+                self.intermediate_size,
+                self.prefill_gate_up_in0_block_w,
+            )
+            if self.prefill_gate_up_in0_block_w is not None
             else None
         )
 
@@ -184,7 +265,13 @@ class SharedMLP:
         """
         # gate = GELU(x @ gate_proj)
         is_decode = hidden_states.shape[-2] == ttnn.TILE_SIZE
-        gate_up_program_config = self.decode_gate_up_program_config if is_decode else None
+        is_target_prefill = hidden_states.shape[-2] == PREFILL_PROGRAM_SEQUENCE_LENGTH
+        if is_decode:
+            gate_up_program_config = self.decode_gate_up_program_config
+        elif is_target_prefill:
+            gate_up_program_config = self.prefill_gate_up_program_config
+        else:
+            gate_up_program_config = None
 
         if gate_up_program_config is None:
             gate = ttnn.linear(hidden_states, self.gate_proj)
