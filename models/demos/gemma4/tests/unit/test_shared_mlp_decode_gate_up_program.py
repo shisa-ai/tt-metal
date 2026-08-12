@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+from types import SimpleNamespace
+
+import pytest
+
+from models.demos.gemma4.tt import shared_mlp
+
+
+class FakeTensor:
+    def __init__(self, name, shape=(1, 1, 32, 2560)):
+        self.name = name
+        self.shape = shape
+
+    def deallocate(self, force):
+        assert force is True
+
+
+@pytest.mark.parametrize("value", [True, "1", "true", "YES", "on"])
+def test_bool_selector_accepts_true_values(value):
+    assert shared_mlp._resolve_bool_env("TEST_SELECTOR", value) is True
+
+
+@pytest.mark.parametrize("value", [False, "0", "false", "NO", "off"])
+def test_bool_selector_accepts_false_values(value):
+    assert shared_mlp._resolve_bool_env("TEST_SELECTOR", value) is False
+
+
+def test_bool_selector_rejects_unknown_value(expect_error):
+    with expect_error(ValueError, "TEST_SELECTOR"):
+        shared_mlp._resolve_bool_env("TEST_SELECTOR", "sometimes")
+
+
+def test_decode_config_uses_shape_derived_blocking(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(shared_mlp.ttnn, "CoreCoord", lambda x, y: (x, y))
+    monkeypatch.setattr(
+        shared_mlp.ttnn,
+        "MatmulMultiCoreReuseMultiCast1DProgramConfig",
+        lambda **kwargs: captured.update(kwargs) or kwargs,
+    )
+    mesh = SimpleNamespace(compute_with_storage_grid_size=lambda: SimpleNamespace(x=8, y=9))
+
+    config = shared_mlp._decode_gate_up_program_config(mesh, hidden_size=2560, intermediate_size=10240)
+
+    assert config == captured
+    assert captured == {
+        "compute_with_storage_grid_size": (8, 9),
+        "in0_block_w": 20,
+        "out_subblock_h": 1,
+        "out_subblock_w": 5,
+        "per_core_M": 1,
+        "per_core_N": 5,
+        "fuse_batch": False,
+        "fused_activation": None,
+        "mcast_in0": True,
+    }
+
+
+@pytest.mark.parametrize("decode", [False, True])
+def test_program_config_applies_only_to_decode_gate_up(monkeypatch, decode):
+    calls = []
+    shape = (1, 1, 32 if decode else 1024, 2560)
+    hidden_states = FakeTensor("input", shape=shape)
+    gate = FakeTensor("gate")
+    up = FakeTensor("up")
+    hidden = FakeTensor("hidden")
+    output = FakeTensor("output")
+    decode_config = object()
+
+    def linear(tensor, weight, program_config=None):
+        calls.append((weight.name, program_config))
+        return {"gate_weight": gate, "up_weight": up, "down_weight": output}[weight.name]
+
+    monkeypatch.setattr(shared_mlp.ttnn, "linear", linear)
+    monkeypatch.setattr(shared_mlp.ttnn, "gelu", lambda tensor, **kwargs: tensor)
+    monkeypatch.setattr(shared_mlp.ttnn, "mul", lambda lhs, rhs, **kwargs: hidden)
+
+    mlp = object.__new__(shared_mlp.SharedMLP)
+    mlp.fuse_gate_gelu_mul = False
+    mlp.decode_gate_up_program_config = decode_config
+    mlp.gate_proj = FakeTensor("gate_weight")
+    mlp.up_proj = FakeTensor("up_weight")
+    mlp.down_proj = FakeTensor("down_weight")
+    mlp.mesh_config = SimpleNamespace(tp=1)
+
+    assert mlp(hidden_states) is output
+    expected = decode_config if decode else None
+    assert calls == [("gate_weight", expected), ("up_weight", expected), ("down_weight", None)]
+
+
+def test_fused_accurate_gelu_mul_removes_standalone_gelu(monkeypatch):
+    calls = []
+    gate = FakeTensor("gate")
+    up = FakeTensor("up")
+    hidden = FakeTensor("hidden")
+    output = FakeTensor("output")
+    activation = object()
+
+    monkeypatch.setattr(shared_mlp.ttnn, "UnaryWithParam", lambda op, value: activation)
+    monkeypatch.setattr(
+        shared_mlp.ttnn,
+        "linear",
+        lambda tensor, weight, program_config=None: {
+            "gate_weight": gate,
+            "up_weight": up,
+            "down_weight": output,
+        }[weight.name],
+    )
+    monkeypatch.setattr(shared_mlp.ttnn, "gelu", lambda *args, **kwargs: pytest.fail("standalone GELU called"))
+    monkeypatch.setattr(
+        shared_mlp.ttnn,
+        "mul",
+        lambda lhs, rhs, input_tensor_a_activations=None: calls.append(input_tensor_a_activations) or hidden,
+    )
+
+    mlp = object.__new__(shared_mlp.SharedMLP)
+    mlp.fuse_gate_gelu_mul = True
+    mlp.decode_gate_up_program_config = None
+    mlp.gate_proj = FakeTensor("gate_weight")
+    mlp.up_proj = FakeTensor("up_weight")
+    mlp.down_proj = FakeTensor("down_weight")
+    mlp.mesh_config = SimpleNamespace(tp=1)
+
+    assert mlp(FakeTensor("input")) is output
+    assert calls == [[activation]]

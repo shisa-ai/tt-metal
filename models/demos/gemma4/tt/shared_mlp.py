@@ -14,9 +14,49 @@ HF weight shapes:
   down_proj.weight: [hidden_size, intermediate_size] = [2816, 2112]
 """
 
+import os
+
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
+
+FUSED_GATE_GELU_MUL_ENV = "GEMMA4_FUSED_SHARED_MLP_GATE_GELU_MUL"
+DECODE_GATE_UP_PROGRAM_ENV = "GEMMA4_DECODE_SHARED_MLP_GATE_UP_PROGRAM"
+
+
+def _resolve_bool_env(name, value=None):
+    if value is None:
+        value = os.environ.get(name, "0")
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{name} must be a boolean value, got {value!r}")
+
+
+def _decode_gate_up_program_config(mesh_device, hidden_size, intermediate_size):
+    """Use the widest K block that divides the TP1 Chotto decode shape."""
+    grid = mesh_device.compute_with_storage_grid_size()
+    k_tiles = hidden_size // ttnn.TILE_SIZE
+    n_tiles = intermediate_size // ttnn.TILE_SIZE
+    core_count = grid.x * grid.y
+    per_core_n = (n_tiles + core_count - 1) // core_count
+    in0_block_w = max(width for width in range(1, 33) if k_tiles % width == 0)
+    out_subblock_w = max(width for width in range(1, min(per_core_n, 8) + 1) if per_core_n % width == 0)
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
+        in0_block_w=in0_block_w,
+        out_subblock_h=1,
+        out_subblock_w=out_subblock_w,
+        per_core_M=1,
+        per_core_N=per_core_n,
+        fuse_batch=False,
+        fused_activation=None,
+        mcast_in0=True,
+    )
 
 
 class SharedMLP:
@@ -29,6 +69,8 @@ class SharedMLP:
         ccl_manager=None,
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
+        fuse_gate_gelu_mul=None,
+        decode_gate_up_program=None,
     ):
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
@@ -38,6 +80,15 @@ class SharedMLP:
 
         tp = mesh_config.tp if mesh_config else 1
         tp_suffix = f"_tp{tp}" if tp > 1 else ""
+        self.fuse_gate_gelu_mul = _resolve_bool_env(FUSED_GATE_GELU_MUL_ENV, fuse_gate_gelu_mul)
+        self.decode_gate_up_program = _resolve_bool_env(DECODE_GATE_UP_PROGRAM_ENV, decode_gate_up_program)
+        if (self.fuse_gate_gelu_mul or self.decode_gate_up_program) and tp != 1:
+            raise ValueError("experimental shared-MLP selectors are currently qualified only for TP1")
+        self.decode_gate_up_program_config = (
+            _decode_gate_up_program_config(mesh_device, self.hidden_size, self.intermediate_size)
+            if self.decode_gate_up_program
+            else None
+        )
 
         # Tag the cache filenames with the weight dtype so that flipping a
         # SharedMLP weight's dtype (e.g. bf16 → bfp8 for DRAM-pressure relief)
@@ -100,16 +151,39 @@ class SharedMLP:
         gate/up are column-parallel, down is row-parallel + allreduce.
         """
         # gate = GELU(x @ gate_proj)
-        gate = ttnn.linear(hidden_states, self.gate_proj)
-        # Gemma 4's GeGLU is numerically sensitive across layers and decode
-        # steps; FastLut drift can change greedy token selection.
-        gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+        is_decode = hidden_states.shape[-2] == ttnn.TILE_SIZE
+        gate_up_program_config = self.decode_gate_up_program_config if is_decode else None
+
+        if gate_up_program_config is None:
+            gate = ttnn.linear(hidden_states, self.gate_proj)
+        else:
+            gate = ttnn.linear(
+                hidden_states,
+                self.gate_proj,
+                program_config=gate_up_program_config,
+            )
 
         # up = x @ up_proj
-        up = ttnn.linear(hidden_states, self.up_proj)
+        if gate_up_program_config is None:
+            up = ttnn.linear(hidden_states, self.up_proj)
+        else:
+            up = ttnn.linear(
+                hidden_states,
+                self.up_proj,
+                program_config=gate_up_program_config,
+            )
 
-        # hidden = gate * up
-        hidden = ttnn.mul(gate, up)
+        if self.fuse_gate_gelu_mul:
+            hidden = ttnn.mul(
+                gate,
+                up,
+                input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.GELU, 0.0)],
+            )
+        else:
+            # Gemma 4's GeGLU is numerically sensitive across layers and decode
+            # steps; FastLut drift can change greedy token selection.
+            gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+            hidden = ttnn.mul(gate, up)
         gate.deallocate(True)
         up.deallocate(True)
 
