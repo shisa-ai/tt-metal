@@ -15,6 +15,7 @@ Supports both prefill and decode modes with paged attention.
 Compatible with tt_transformers Generator interface.
 """
 
+import os
 
 import torch
 from loguru import logger
@@ -25,6 +26,13 @@ from models.common.modules.mlp.mlp_1d import _dram_matmul_config, _dram_shard_co
 from models.common.sampling.generator import SamplingGenerator
 from models.demos.gemma4.tt.attention import Gemma4AttentionConfig
 from models.demos.gemma4.tt.layer import Gemma4DecoderLayer
+from models.demos.gemma4.tt.lm_head_config import (
+    CHOTTO_TP1_LM_HEAD_HIDDEN_SIZE,
+    CHOTTO_TP1_LM_HEAD_VOCAB_SIZE,
+    TP1_LM_HEAD_DRAM_SHARD_CHUNK_SIZE_ENV,
+    TP1_LM_HEAD_DRAM_SHARD_DEFAULT_CHUNK_SIZE,
+    resolve_tp1_lm_head_dram_shard_chunk_size,
+)
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
@@ -37,7 +45,7 @@ from models.demos.gemma4.utils.substate import substate
 # tt_transformers Generator (the model returns logits in sampling layout),
 # so it is profiled there / by op name (SamplingDeviceOperation, TopK).
 LM_HEAD_SIGNPOST = "gemma4_lm_head"
-LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE = 8192
+LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE = TP1_LM_HEAD_DRAM_SHARD_DEFAULT_CHUNK_SIZE
 
 
 def _create_lm_head_dram_sharded_weight_config(mesh_device, k: int, n: int):
@@ -368,15 +376,26 @@ class Gemma4Model:
             # sustain substantially more of the device bandwidth. Keeping the
             # chunks separate also bounds the matmul's L1 circular buffers.
             lm_head_suffix = f"_{dtype_to_str(lm_head_dtype)}"
-            use_tp1_dram_sharded_lm_head = (
-                tp == 1
-                and lm_head_dtype == ttnn.bfloat16
-                and self.vocab_size % LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE == 0
-                and self.hidden_size % ttnn.TILE_SIZE == 0
+            requested_lm_head_chunk_size = os.environ.get(TP1_LM_HEAD_DRAM_SHARD_CHUNK_SIZE_ENV, "0")
+            lm_head_chunk_eligible = (
+                tp == 1 and lm_head_dtype == ttnn.bfloat16 and self.hidden_size % ttnn.TILE_SIZE == 0
             )
+            lm_head_screen_shape = (
+                self.hidden_size == CHOTTO_TP1_LM_HEAD_HIDDEN_SIZE and self.vocab_size == CHOTTO_TP1_LM_HEAD_VOCAB_SIZE
+            )
+            if requested_lm_head_chunk_size not in ("", "0") and not (lm_head_chunk_eligible and lm_head_screen_shape):
+                raise ValueError(
+                    f"{TP1_LM_HEAD_DRAM_SHARD_CHUNK_SIZE_ENV} is supported only for the BF16 TP1 Chotto LM head"
+                )
+            lm_head_chunk_size = LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE
+            if lm_head_chunk_eligible and lm_head_screen_shape:
+                lm_head_chunk_size = resolve_tp1_lm_head_dram_shard_chunk_size(
+                    self.hidden_size, self.vocab_size, requested_lm_head_chunk_size
+                )
+            use_tp1_dram_sharded_lm_head = lm_head_chunk_eligible and self.vocab_size % lm_head_chunk_size == 0
             self.lm_head_dram_sharded_weights = []
             if use_tp1_dram_sharded_lm_head:
-                chunk_size = LM_HEAD_TP1_DRAM_SHARD_CHUNK_SIZE
+                chunk_size = lm_head_chunk_size
                 weight_memcfg = _create_lm_head_dram_sharded_weight_config(mesh_device, self.hidden_size, chunk_size)
                 for split_idx, start in enumerate(range(0, self.vocab_size, chunk_size)):
                     # Slice vocab rows before transposing so only one ~42 MiB
