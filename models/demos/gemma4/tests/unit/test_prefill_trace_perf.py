@@ -26,6 +26,7 @@ from models.demos.gemma4.tt.generator_trace import (
     GEMMA4_TRACE_PREFILL_SEQ_LENS,
     can_gemma4_enable_prefill_trace,
 )
+from models.demos.gemma4.tt.pli import resolve_pli_prefill_trace_enabled
 from models.perf.benchmarking_utils import BenchmarkProfiler
 from models.tt_transformers.tt.common import get_padded_prefill_len
 from models.tt_transformers.tt.generator import SUPPORTED_PREFILL_BATCH_SIZES
@@ -55,8 +56,10 @@ def test_prefill_trace_perf(batch_size, prefill_len, mesh_device, reset_seeds, r
         pytest.skip(f"prefill_len={prefill_len} > --max-prefill={max_prefill}")
 
     hf_config = TestFactory.create_hf_config()
-    if int(getattr(hf_config, "hidden_size_per_layer_input", 0) or 0) > 0:
-        pytest.skip("PLI models disable prefill trace")
+    uses_pli = int(getattr(hf_config, "hidden_size_per_layer_input", 0) or 0) > 0
+    pli_trace_supported = uses_pli and resolve_pli_prefill_trace_enabled()
+    if uses_pli and not pli_trace_supported:
+        pytest.skip("PLI prefill trace requires GEMMA4_PLI_PREFILL_TRACE=1")
 
     kernel_len = get_padded_prefill_len(prefill_len)
     if _batch_prefill_hits_ceiling(batch_size, prefill_len):
@@ -69,7 +72,12 @@ def test_prefill_trace_perf(batch_size, prefill_len, mesh_device, reset_seeds, r
         pytest.skip(f"kernel_len={kernel_len} not in trace ISL buckets {GEMMA4_TRACE_PREFILL_SEQ_LENS}")
 
     max_padded_batch = next(b for b in SUPPORTED_PREFILL_BATCH_SIZES if b >= batch_size)
-    if not can_gemma4_enable_prefill_trace(kernel_len, batch_size=max_padded_batch):
+    if not can_gemma4_enable_prefill_trace(
+        kernel_len,
+        batch_size=max_padded_batch,
+        uses_pli=uses_pli,
+        pli_trace_supported=pli_trace_supported,
+    ):
         pytest.skip(
             f"prefill trace disabled for padded_batch={max_padded_batch} x kernel={kernel_len} "
             f"(ISL>{GEMMA4_MAX_TRACE_PREFILL_SEQ_LEN} or "

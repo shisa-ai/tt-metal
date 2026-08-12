@@ -33,6 +33,7 @@ from models.demos.gemma4.tt.lm_head_config import (
     TP1_LM_HEAD_DRAM_SHARD_DEFAULT_CHUNK_SIZE,
     resolve_tp1_lm_head_dram_shard_chunk_size,
 )
+from models.demos.gemma4.tt.pli import pack_prefill_per_layer_inputs
 from models.demos.gemma4.tt.rms_norm import RMSNorm
 from models.demos.gemma4.utils.general_utils import cast_host_for_ttnn, get_cache_file_name
 from models.demos.gemma4.utils.substate import substate
@@ -256,6 +257,10 @@ class Gemma4Model:
     # NOTE: This is a runtime capability (depends on mesh shape / per-device vocab).
     # It is set during __init__ after the sampling module is constructed.
     _supports_on_device_sampling = False
+    # PLI prefill can bind a persistent combined device buffer during trace
+    # capture and refresh its contents outside every replay. Runtime use remains
+    # opt-in through GEMMA4_PLI_PREFILL_TRACE until hardware promotion.
+    supports_pli_prefill_trace = True
 
     def __init__(
         self,
@@ -475,6 +480,8 @@ class Gemma4Model:
         # ``ttnn_prefill_forward`` and bypass this stash.
         self._prefill_input_ids_torch = None
         self._prefill_embeds_torch = None
+        self._prefill_pli_trace_buffers = {}
+        self._active_prefill_pli_trace_buffer = None
 
         # Stash for the per-layer-input (PLI) device tensor produced in
         # ``prepare_decode_inputs_host``. ``Generator``'s decode path
@@ -744,6 +751,37 @@ class Gemma4Model:
         # Return as list of per-layer tensors
         return [per_layer_inputs[:, :, i, :].to(torch.bfloat16) for i in range(n_layers)]
 
+    def _prepare_prefill_pli_trace_buffer(self, *, batch_size: int, per_user_seq_len: int):
+        """Allocate or refresh one persistent combined PLI buffer out of trace."""
+        per_layer_inputs = self._compute_per_layer_inputs(self._prefill_input_ids_torch, self._prefill_embeds_torch)
+        if per_layer_inputs is None:
+            self._active_prefill_pli_trace_buffer = None
+            return None
+        packed = pack_prefill_per_layer_inputs(per_layer_inputs, len(self.layers))
+        key = (int(batch_size), int(per_user_seq_len))
+        persistent = self._prefill_pli_trace_buffers.get(key)
+        mesh_mapper = self._replicate_to_mesh_mapper()
+        if persistent is None:
+            persistent = ttnn.from_torch(
+                packed,
+                device=self.mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=mesh_mapper,
+            )
+            self._prefill_pli_trace_buffers[key] = persistent
+        else:
+            host = ttnn.from_torch(
+                packed,
+                device=None,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=mesh_mapper,
+            )
+            ttnn.copy_host_to_device_tensor(host, persistent)
+        self._active_prefill_pli_trace_buffer = persistent
+        return persistent
+
     def _get_rope_mats(self, layer_idx, seq_len=None, for_decode=False, start_pos=0):
         """Get (cos, sin) for a given layer.
 
@@ -810,7 +848,9 @@ class Gemma4Model:
             embeds_torch: CPU tensor of embeddings for per-layer input projection (E2B)
             pli_device_tensors: optional list of pre-computed PLI device tensors (trace mode)
             position_idx_cache: optional [batch] int32 tensor for KV cache update (when position_idx is uint32)
-            pli_combined: optional [1,1,n_layers,pli_size] device tensor of pre-computed PLI (decode)
+            pli_combined: optional combined device tensor of pre-computed PLI:
+                [1,1,n_layers,pli_size] for single-user decode or
+                [1,n_layers,batch*seq,pli_size] for prefill/batched decode
             page_tables_per_layer: optional list of per-layer page tables, one
                 entry per decoder layer. When set, each layer's attention
                 receives ``page_tables_per_layer[i]`` instead of ``page_table``.
@@ -920,8 +960,13 @@ class Gemma4Model:
                 #   * [1, n_layers, B, pli_size] — batched (one row per user)
                 if pli_combined_tt.shape[1] == len(self.layers):
                     pli_tt = pli_combined_tt[:, i : i + 1, :, :]  # [1, 1, B, pli_size]
-                else:
+                elif pli_combined_tt.shape[2] == len(self.layers):
                     pli_tt = pli_combined_tt[:, :, i : i + 1, :]  # [1, 1, 1, pli_size]
+                else:
+                    raise ValueError(
+                        f"pli_combined shape {tuple(pli_combined_tt.shape)} has no "
+                        f"layer axis of length {len(self.layers)}"
+                    )
             elif pli_device_tensors is not None:
                 # Pre-computed device tensors (legacy trace mode). Length was
                 # validated to match len(self.layers) for PLI models above.
@@ -1570,7 +1615,16 @@ class Gemma4Model:
             self._prefill_embeds_torch = None
 
         if trace_enabled:
+            if self.hidden_size_per_layer_input and self.per_layer_input_weights:
+                self._prepare_prefill_pli_trace_buffer(
+                    batch_size=batch_size,
+                    per_user_seq_len=per_user_seq_len,
+                )
+            else:
+                self._active_prefill_pli_trace_buffer = None
             return tt_tokens, None, None, tt_page_table, tt_chunk_page_table, None
+
+        self._active_prefill_pli_trace_buffer = None
 
         tt_embeds = self.embed_tokens(tt_tokens)
         if batch_size > 1:
@@ -1631,6 +1685,7 @@ class Gemma4Model:
         input_ids_torch=None,
         embeds_torch=None,
         pli_device_tensors=None,
+        pli_combined=None,
         page_tables_per_layer=None,
         **kwargs,
     ):
@@ -1663,6 +1718,10 @@ class Gemma4Model:
         if page_tables_per_layer is None:
             page_tables_per_layer = getattr(self, "_active_page_tables_per_layer", None)
         page_tables_per_layer = self._page_tables_to_ttnn(page_tables_per_layer)
+        if pli_combined is None and pli_device_tensors is None and getattr(self, "_prefill_trace_mode", False):
+            pli_combined = self._active_prefill_pli_trace_buffer
+            if self.hidden_size_per_layer_input and self.per_layer_input_weights and pli_combined is None:
+                raise ValueError("PLI prefill trace requires a prepared persistent combined PLI buffer")
         return self(
             hidden_states=x,
             position_idx=None,
@@ -1672,6 +1731,7 @@ class Gemma4Model:
             input_ids_torch=input_ids_torch,
             embeds_torch=embeds_torch,
             pli_device_tensors=pli_device_tensors,
+            pli_combined=pli_combined,
             get_last_token=get_last_token,
             page_tables_per_layer=page_tables_per_layer,
             batch_size=batch_size,

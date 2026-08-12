@@ -8,6 +8,7 @@ import os
 import torch
 from loguru import logger
 
+from models.demos.gemma4.tt.pli import resolve_pli_prefill_trace_enabled
 from models.tt_transformers.tt.generator import (
     MAX_BATCHED_PREFILL_SEQ_LEN,
     SUPPORTED_PREFILL_BATCH_SIZES,
@@ -289,9 +290,10 @@ def can_gemma4_enable_prefill_trace(
     batch_size: int = 1,
     num_cached_tokens: int = 0,
     uses_pli: bool = False,
+    pli_trace_supported: bool = False,
 ) -> bool:
     """Return True when Gemma4 prefill device trace may be captured or replayed."""
-    if uses_pli or num_cached_tokens != 0:
+    if (uses_pli and not pli_trace_supported) or num_cached_tokens != 0:
         return False
     if prefill_seq_len > GEMMA4_MAX_TRACE_PREFILL_SEQ_LEN:
         return False
@@ -315,6 +317,9 @@ def apply_gemma4_prefill_trace_policy(
         prefill_seq_len,
         batch_size=batch_size,
         uses_pli=model_uses_pli(model),
+        pli_trace_supported=(
+            bool(getattr(model, "supports_pli_prefill_trace", False)) and resolve_pli_prefill_trace_enabled()
+        ),
     ):
         return True
     if prefill_seq_len > GEMMA4_MAX_TRACE_PREFILL_SEQ_LEN:
@@ -381,6 +386,7 @@ def patch_gemma4_trace_model_args(model_args, *, prefill_trace_enabled: bool = T
             length for length in GEMMA4_TRACE_PREFILL_SEQ_LENS if length <= GEMMA4_MAX_TRACE_PREFILL_SEQ_LEN
         ]
         uses_pli = bool(getattr(model_args, "hidden_size_per_layer_input", 0))
+        pli_trace_supported = uses_pli and resolve_pli_prefill_trace_enabled()
 
         def _can_enable_trace(prefill_seq_len, num_cached_tokens=0, batch_size=1):
             return can_gemma4_enable_prefill_trace(
@@ -388,6 +394,7 @@ def patch_gemma4_trace_model_args(model_args, *, prefill_trace_enabled: bool = T
                 batch_size=batch_size,
                 num_cached_tokens=num_cached_tokens,
                 uses_pli=uses_pli,
+                pli_trace_supported=pli_trace_supported,
             )
 
         model_args.can_enable_trace = _can_enable_trace
@@ -397,15 +404,15 @@ def patch_gemma4_trace_model_args(model_args, *, prefill_trace_enabled: bool = T
 
 
 def maybe_disable_pli_prefill_trace(enable_trace: bool, model, batch_size: int = 1) -> bool:
-    """Return False when PLI prefill must not use trace capture.
-
-    PLI prefill uploads per-layer inputs via ttnn.from_torch inside forward, which
-    triggers TT_FATAL during trace capture. Decode trace is unaffected.
-    """
-    if enable_trace and model_uses_pli(model):
+    """Keep PLI prefill eager unless persistent-buffer trace is explicitly enabled."""
+    if (
+        enable_trace
+        and model_uses_pli(model)
+        and not (getattr(model, "supports_pli_prefill_trace", False) and resolve_pli_prefill_trace_enabled())
+    ):
         logger.info(
             "Disabling prefill trace on PLI model (batch_size={}): "
-            "in-forward ttnn.from_torch PLI upload is incompatible with trace capture",
+            "set GEMMA4_PLI_PREFILL_TRACE=1 to use the persistent combined-PLI buffer",
             batch_size,
         )
         return False
@@ -448,7 +455,7 @@ def warmup_gemma4_batched_prefill_traces(
     greedy_only: bool = False,
     prefill_forward_fn=None,
 ) -> None:
-    """Capture prefill traces for MoE models across batch sizes and trace ISLs.
+    """Capture eligible prefill traces across batch sizes and trace ISLs.
 
     Sweeps ``SUPPORTED_PREFILL_BATCH_SIZES`` × ``trace_prefill_supported_seq_lens``,
     skipping combinations that meet or exceed ``MAX_BATCHED_PREFILL_SEQ_LEN`` (128k).
