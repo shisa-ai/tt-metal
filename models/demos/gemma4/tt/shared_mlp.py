@@ -14,9 +14,27 @@ HF weight shapes:
   down_proj.weight: [hidden_size, intermediate_size] = [2816, 2112]
 """
 
+import os
+
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
+
+FUSED_GATE_GELU_MUL_ENV = "GEMMA4_FUSED_SHARED_MLP_GATE_GELU_MUL"
+
+
+def _resolve_fused_gate_gelu_mul(value=None):
+    """Resolve the bounded gate-GELU/multiply selector without changing the default."""
+    if value is None:
+        value = os.environ.get(FUSED_GATE_GELU_MUL_ENV, "0")
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{FUSED_GATE_GELU_MUL_ENV} must be a boolean value, got {value!r}")
 
 
 class SharedMLP:
@@ -29,6 +47,7 @@ class SharedMLP:
         ccl_manager=None,
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
+        fuse_gate_gelu_mul=None,
     ):
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
@@ -38,6 +57,9 @@ class SharedMLP:
 
         tp = mesh_config.tp if mesh_config else 1
         tp_suffix = f"_tp{tp}" if tp > 1 else ""
+        self.fuse_gate_gelu_mul = _resolve_fused_gate_gelu_mul(fuse_gate_gelu_mul)
+        if self.fuse_gate_gelu_mul and tp != 1:
+            raise ValueError(f"{FUSED_GATE_GELU_MUL_ENV} is currently qualified only for TP1")
 
         # Tag the cache filenames with the weight dtype so that flipping a
         # SharedMLP weight's dtype (e.g. bf16 → bfp8 for DRAM-pressure relief)
@@ -99,17 +121,26 @@ class SharedMLP:
 
         gate/up are column-parallel, down is row-parallel + allreduce.
         """
-        # gate = GELU(x @ gate_proj)
+        # gate = x @ gate_proj
         gate = ttnn.linear(hidden_states, self.gate_proj)
-        # Gemma 4's GeGLU is numerically sensitive across layers and decode
-        # steps; FastLut drift can change greedy token selection.
-        gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
 
         # up = x @ up_proj
         up = ttnn.linear(hidden_states, self.up_proj)
 
-        # hidden = gate * up
-        hidden = ttnn.mul(gate, up)
+        if self.fuse_gate_gelu_mul:
+            # Param 0 selects accurate GELU. Applying it to the left input of
+            # the binary kernel preserves GELU(gate) * up while removing the
+            # standalone unary program; the full model quality gate remains.
+            hidden = ttnn.mul(
+                gate,
+                up,
+                input_tensor_a_activations=[ttnn.UnaryWithParam(ttnn.UnaryOpType.GELU, 0.0)],
+            )
+        else:
+            # Gemma 4's GeGLU is numerically sensitive across layers and decode
+            # steps; FastLut drift can change greedy token selection.
+            gate = ttnn.gelu(gate, fast_and_approximate_mode=False)
+            hidden = ttnn.mul(gate, up)
         gate.deallocate(True)
         up.deallocate(True)
 
