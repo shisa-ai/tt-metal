@@ -195,6 +195,7 @@ def test_program_config_applies_only_to_target_phase(monkeypatch, sequence_lengt
     monkeypatch.setattr(shared_mlp.ttnn, "mul", lambda lhs, rhs, **kwargs: hidden)
 
     mlp = object.__new__(shared_mlp.SharedMLP)
+    mlp.layer_idx = None
     mlp.fuse_gate_gelu_mul = False
     mlp.decode_gate_up_program_config = decode_config
     mlp.prefill_gate_up_program_config = prefill_config
@@ -235,6 +236,7 @@ def test_fused_accurate_gelu_mul_removes_standalone_gelu(monkeypatch):
     )
 
     mlp = object.__new__(shared_mlp.SharedMLP)
+    mlp.layer_idx = None
     mlp.fuse_gate_gelu_mul = True
     mlp.decode_gate_up_program_config = None
     mlp.prefill_gate_up_program_config = None

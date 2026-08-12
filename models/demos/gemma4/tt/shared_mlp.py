@@ -378,8 +378,8 @@ def _apply_down_projection(hidden_states, weight, layer_idx, program_config=None
 class SharedMLP:
     BOUNDARY_CAPTURE_NAMES = (
         "gate_projection",
-        "gate_gelu",
         "up_projection",
+        "gate_gelu",
         "gated_product",
         "down_projection",
     )

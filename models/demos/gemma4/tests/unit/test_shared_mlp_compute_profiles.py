@@ -84,6 +84,27 @@ def test_down_proj_decode_program_profile_applies_only_to_exact_layer38_shape(mo
     ]
 
 
+def test_down_proj_rejects_exact_and_performance_programs_together(monkeypatch, expect_error):
+    monkeypatch.delenv(shared_mlp.DOWN_PROJ_COMPUTE_PROFILE_ENV, raising=False)
+    monkeypatch.setenv(
+        shared_mlp.DOWN_PROJ_PROGRAM_PROFILE_ENV,
+        shared_mlp.DOWN_PROJ_LAYER38_DECODE_MCAST1D_W8_PROFILE,
+    )
+    monkeypatch.setattr(
+        ttnn,
+        "MatmulMultiCoreReuseMultiCast1DProgramConfig",
+        lambda **kwargs: "exact-program",
+    )
+
+    with expect_error(ValueError, "cannot be composed"):
+        shared_mlp._apply_down_projection(
+            _FakeActivation(_FakeDevice()),
+            "weight",
+            layer_idx=38,
+            program_config="performance-program",
+        )
+
+
 def test_down_proj_decode_program_profiles_select_block_width(monkeypatch):
     program_calls = []
     monkeypatch.setattr(
