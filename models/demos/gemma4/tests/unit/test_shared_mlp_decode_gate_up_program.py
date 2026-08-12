@@ -32,7 +32,32 @@ def test_bool_selector_rejects_unknown_value(expect_error):
         shared_mlp._resolve_bool_env("TEST_SELECTOR", "sometimes")
 
 
-def test_decode_config_uses_shape_derived_blocking(monkeypatch):
+def test_decode_widths_enumerate_all_safe_chotto_k_blocks():
+    assert shared_mlp._decode_gate_up_in0_block_widths(2560) == (1, 2, 4, 5, 8, 10, 16, 20)
+
+
+@pytest.mark.parametrize("value", [1, "2", " 20 "])
+def test_decode_width_selector_accepts_safe_explicit_widths(value):
+    assert shared_mlp._resolve_decode_gate_up_in0_block_w(2560, value) == int(value)
+
+
+@pytest.mark.parametrize("value", [0, "0"])
+def test_decode_width_selector_zero_disables_program(value):
+    assert shared_mlp._resolve_decode_gate_up_in0_block_w(2560, value) is None
+
+
+@pytest.mark.parametrize("value", [True, False, "auto", -1, 3, 32])
+def test_decode_width_selector_rejects_implicit_or_unsafe_values(expect_error, value):
+    with expect_error(ValueError, shared_mlp.DECODE_GATE_UP_IN0_BLOCK_W_ENV):
+        shared_mlp._resolve_decode_gate_up_in0_block_w(2560, value)
+
+
+def test_decode_width_selector_reads_environment(monkeypatch):
+    monkeypatch.setenv(shared_mlp.DECODE_GATE_UP_IN0_BLOCK_W_ENV, "10")
+    assert shared_mlp._resolve_decode_gate_up_in0_block_w(2560) == 10
+
+
+def test_decode_config_uses_explicit_safe_blocking(monkeypatch):
     captured = {}
     monkeypatch.setattr(shared_mlp.ttnn, "CoreCoord", lambda x, y: (x, y))
     monkeypatch.setattr(
@@ -42,12 +67,17 @@ def test_decode_config_uses_shape_derived_blocking(monkeypatch):
     )
     mesh = SimpleNamespace(compute_with_storage_grid_size=lambda: SimpleNamespace(x=8, y=9))
 
-    config = shared_mlp._decode_gate_up_program_config(mesh, hidden_size=2560, intermediate_size=10240)
+    config = shared_mlp._decode_gate_up_program_config(
+        mesh,
+        hidden_size=2560,
+        intermediate_size=10240,
+        in0_block_w=10,
+    )
 
     assert config == captured
     assert captured == {
         "compute_with_storage_grid_size": (8, 9),
-        "in0_block_w": 20,
+        "in0_block_w": 10,
         "out_subblock_h": 1,
         "out_subblock_w": 5,
         "per_core_M": 1,

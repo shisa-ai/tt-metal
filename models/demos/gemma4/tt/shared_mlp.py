@@ -21,7 +21,8 @@ from models.demos.gemma4.tt.ccl import ccl_allreduce
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 FUSED_GATE_GELU_MUL_ENV = "GEMMA4_FUSED_SHARED_MLP_GATE_GELU_MUL"
-DECODE_GATE_UP_PROGRAM_ENV = "GEMMA4_DECODE_SHARED_MLP_GATE_UP_PROGRAM"
+DECODE_GATE_UP_IN0_BLOCK_W_ENV = "GEMMA4_DECODE_SHARED_MLP_GATE_UP_IN0_BLOCK_W"
+MAX_EXPERIMENTAL_IN0_BLOCK_W = 32
 
 
 def _resolve_bool_env(name, value=None):
@@ -37,14 +38,38 @@ def _resolve_bool_env(name, value=None):
     raise ValueError(f"{name} must be a boolean value, got {value!r}")
 
 
-def _decode_gate_up_program_config(mesh_device, hidden_size, intermediate_size):
-    """Use the widest K block that divides the TP1 Chotto decode shape."""
-    grid = mesh_device.compute_with_storage_grid_size()
+def _decode_gate_up_in0_block_widths(hidden_size):
+    if hidden_size % ttnn.TILE_SIZE != 0:
+        raise ValueError(f"hidden_size must be tile-aligned, got {hidden_size}")
     k_tiles = hidden_size // ttnn.TILE_SIZE
+    return tuple(width for width in range(1, min(k_tiles, MAX_EXPERIMENTAL_IN0_BLOCK_W) + 1) if k_tiles % width == 0)
+
+
+def _resolve_decode_gate_up_in0_block_w(hidden_size, value=None):
+    if value is None:
+        value = os.environ.get(DECODE_GATE_UP_IN0_BLOCK_W_ENV, "0")
+    if isinstance(value, bool):
+        raise ValueError(f"{DECODE_GATE_UP_IN0_BLOCK_W_ENV} requires an explicit integer width, got {value!r}")
+    try:
+        width = int(str(value).strip())
+    except ValueError as error:
+        raise ValueError(f"{DECODE_GATE_UP_IN0_BLOCK_W_ENV} requires an integer width, got {value!r}") from error
+    if width == 0:
+        return None
+    widths = _decode_gate_up_in0_block_widths(hidden_size)
+    if width not in widths:
+        raise ValueError(
+            f"{DECODE_GATE_UP_IN0_BLOCK_W_ENV} must be 0 or one of {widths} for hidden_size={hidden_size}, got {width}"
+        )
+    return width
+
+
+def _decode_gate_up_program_config(mesh_device, hidden_size, intermediate_size, in0_block_w):
+    """Build an explicit TP1 decode program for a validated K-block width."""
+    grid = mesh_device.compute_with_storage_grid_size()
     n_tiles = intermediate_size // ttnn.TILE_SIZE
     core_count = grid.x * grid.y
     per_core_n = (n_tiles + core_count - 1) // core_count
-    in0_block_w = max(width for width in range(1, 33) if k_tiles % width == 0)
     out_subblock_w = max(width for width in range(1, min(per_core_n, 8) + 1) if per_core_n % width == 0)
     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
@@ -70,7 +95,7 @@ class SharedMLP:
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
         fuse_gate_gelu_mul=None,
-        decode_gate_up_program=None,
+        decode_gate_up_in0_block_w=None,
     ):
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
@@ -81,12 +106,19 @@ class SharedMLP:
         tp = mesh_config.tp if mesh_config else 1
         tp_suffix = f"_tp{tp}" if tp > 1 else ""
         self.fuse_gate_gelu_mul = _resolve_bool_env(FUSED_GATE_GELU_MUL_ENV, fuse_gate_gelu_mul)
-        self.decode_gate_up_program = _resolve_bool_env(DECODE_GATE_UP_PROGRAM_ENV, decode_gate_up_program)
-        if (self.fuse_gate_gelu_mul or self.decode_gate_up_program) and tp != 1:
+        self.decode_gate_up_in0_block_w = _resolve_decode_gate_up_in0_block_w(
+            self.hidden_size, decode_gate_up_in0_block_w
+        )
+        if (self.fuse_gate_gelu_mul or self.decode_gate_up_in0_block_w is not None) and tp != 1:
             raise ValueError("experimental shared-MLP selectors are currently qualified only for TP1")
         self.decode_gate_up_program_config = (
-            _decode_gate_up_program_config(mesh_device, self.hidden_size, self.intermediate_size)
-            if self.decode_gate_up_program
+            _decode_gate_up_program_config(
+                mesh_device,
+                self.hidden_size,
+                self.intermediate_size,
+                self.decode_gate_up_in0_block_w,
+            )
+            if self.decode_gate_up_in0_block_w is not None
             else None
         )
 
