@@ -31,6 +31,20 @@ MAX_PREFILL_DOWN_IN0_BLOCK_W = 20
 PREFILL_PROGRAM_HIDDEN_SIZE = 2560
 PREFILL_PROGRAM_INTERMEDIATE_SIZE = 10240
 PREFILL_PROGRAM_SEQUENCE_LENGTH = 1024
+DOWN_PROJ_COMPUTE_PROFILE_ENV = "GEMMA4_SHARED_MLP_DOWN_PROJ_COMPUTE_PROFILE"
+DOWN_PROJ_LAYER38_HIFI2_FP32_ACC_PROFILE = "layer38_hifi2_fp32_acc"
+DOWN_PROJ_LAYER38_HIFI4_BF16_L1_ACC_PROFILE = "layer38_hifi4_bf16_l1_acc"
+DOWN_PROJ_LAYER38_HIFI3_BF16_L1_ACC_PROFILE = "layer38_hifi3_bf16_l1_acc"
+DOWN_PROJ_LAYER38_LOFI_FP32_ACC_PROFILE = "layer38_lofi_fp32_acc"
+DOWN_PROJ_LAYER38_LOFI_BF16_L1_ACC_PROFILE = "layer38_lofi_bf16_l1_acc"
+DOWN_PROJ_COMPUTE_PROFILE_SPECS = {
+    DOWN_PROJ_LAYER38_HIFI2_FP32_ACC_PROFILE: (ttnn.MathFidelity.HiFi2, True, False),
+    DOWN_PROJ_LAYER38_HIFI4_BF16_L1_ACC_PROFILE: (ttnn.MathFidelity.HiFi4, False, True),
+    DOWN_PROJ_LAYER38_HIFI3_BF16_L1_ACC_PROFILE: (ttnn.MathFidelity.HiFi3, False, True),
+    DOWN_PROJ_LAYER38_LOFI_FP32_ACC_PROFILE: (ttnn.MathFidelity.LoFi, True, False),
+    DOWN_PROJ_LAYER38_LOFI_BF16_L1_ACC_PROFILE: (ttnn.MathFidelity.LoFi, False, True),
+}
+DOWN_PROJ_COMPUTE_PROFILES = frozenset(DOWN_PROJ_COMPUTE_PROFILE_SPECS)
 
 
 def _resolve_bool_env(name, value=None):
@@ -257,6 +271,39 @@ def _prefill_down_program_config(mesh_device, intermediate_size, hidden_size, in
     )
 
 
+def _down_proj_compute_kernel_config(hidden_states, layer_idx):
+    """Return a retained opt-in layer-38 compute profile, if selected."""
+    profile = os.environ.get(DOWN_PROJ_COMPUTE_PROFILE_ENV) or None
+    if profile is None:
+        return None
+    if profile not in DOWN_PROJ_COMPUTE_PROFILES:
+        supported = ", ".join(sorted(DOWN_PROJ_COMPUTE_PROFILES))
+        raise ValueError(f"{DOWN_PROJ_COMPUTE_PROFILE_ENV} must be one of: {supported}")
+    if layer_idx != 38:
+        return None
+    device = hidden_states.device()
+    if device is None:
+        raise ValueError(f"{DOWN_PROJ_COMPUTE_PROFILE_ENV}={profile} requires a device-resident activation")
+    math_fidelity, fp32_dest_acc_en, packer_l1_acc = DOWN_PROJ_COMPUTE_PROFILE_SPECS[profile]
+    return ttnn.init_device_compute_kernel_config(
+        device.arch(),
+        math_fidelity=math_fidelity,
+        math_approx_mode=False,
+        fp32_dest_acc_en=fp32_dest_acc_en,
+        packer_l1_acc=packer_l1_acc,
+    )
+
+
+def _apply_down_projection(hidden_states, weight, layer_idx, program_config=None):
+    kwargs = {}
+    compute_kernel_config = _down_proj_compute_kernel_config(hidden_states, layer_idx)
+    if compute_kernel_config is not None:
+        kwargs["compute_kernel_config"] = compute_kernel_config
+    if program_config is not None:
+        kwargs["program_config"] = program_config
+    return ttnn.linear(hidden_states, weight, **kwargs)
+
+
 class SharedMLP:
     def __init__(
         self,
@@ -267,6 +314,7 @@ class SharedMLP:
         ccl_manager=None,
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
+        layer_idx=None,
         fuse_gate_gelu_mul=None,
         decode_gate_up_in0_block_w=None,
         prefill_gate_up_in0_block_w=None,
@@ -278,6 +326,7 @@ class SharedMLP:
         self.ccl_manager = ccl_manager
         self.hidden_size = hf_config.hidden_size
         self.intermediate_size = hf_config.intermediate_size
+        self.layer_idx = layer_idx
 
         tp = mesh_config.tp if mesh_config else 1
         tp_suffix = f"_tp{tp}" if tp > 1 else ""
@@ -448,10 +497,12 @@ class SharedMLP:
         up.deallocate(True)
 
         # output = hidden @ down_proj
-        if down_program_config is None:
-            output = ttnn.linear(hidden, self.down_proj)
-        else:
-            output = ttnn.linear(hidden, self.down_proj, program_config=down_program_config)
+        output = _apply_down_projection(
+            hidden,
+            self.down_proj,
+            getattr(self, "layer_idx", None),
+            program_config=down_program_config,
+        )
         hidden.deallocate(True)
 
         # Allreduce after row-parallel down_proj
