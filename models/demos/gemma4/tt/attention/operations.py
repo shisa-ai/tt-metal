@@ -113,11 +113,11 @@ def _prefill_sliding_output_program_config(hidden_states, weights):
     input_size = int(hidden_states.shape[-1])
     weight_k = int(weights.o_proj.shape[-2])
     output_size = int(weights.o_proj.shape[-1])
-    if (
-        input_size != PREFILL_SLIDING_OUTPUT_INPUT_SIZE
-        or weight_k != PREFILL_SLIDING_OUTPUT_INPUT_SIZE
-        or output_size != PREFILL_SLIDING_OUTPUT_SIZE
-    ):
+    # ``weights.is_global`` describes KV tying, not the attention layer type.
+    # Use the K=2048 projection shape to leave K=4096 global output unchanged.
+    if input_size != PREFILL_SLIDING_OUTPUT_INPUT_SIZE or weight_k != PREFILL_SLIDING_OUTPUT_INPUT_SIZE:
+        return None
+    if output_size != PREFILL_SLIDING_OUTPUT_SIZE:
         raise ValueError(
             f"{PREFILL_SLIDING_OUTPUT_IN0_BLOCK_W_ENV} requires the Chotto TP1 "
             f"M={PREFILL_SLIDING_OUTPUT_SEQUENCE_LENGTH}, "

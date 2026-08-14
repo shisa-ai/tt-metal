@@ -191,3 +191,22 @@ def test_prefill_sliding_output_program_matches_accepted_geometry(monkeypatch):
             },
         )
     ]
+
+
+def test_prefill_sliding_output_program_leaves_global_projection_unchanged(monkeypatch):
+    monkeypatch.setenv(operations.PREFILL_SLIDING_OUTPUT_IN0_BLOCK_W_ENV, "8")
+    linear_calls = []
+    monkeypatch.setattr(
+        ttnn,
+        "linear",
+        lambda *args, **kwargs: linear_calls.append((args, kwargs)) or "output",
+    )
+
+    activation = _FakeActivation(_FakeDevice(), shape=(1, 1, 1024, 4096))
+    weights = SimpleNamespace(
+        o_proj=SimpleNamespace(shape=(1, 1, 4096, 2560)),
+        is_global=False,
+    )
+
+    assert operations.apply_output_projection(activation, weights) == "output"
+    assert linear_calls == [((activation, weights.o_proj), {})]
