@@ -23,6 +23,9 @@ class _FakeActivation:
     def device(self):
         return self._device
 
+    def deallocate(self, force):
+        pass
+
 
 def test_qkv_compute_profile_unset_preserves_linear_defaults(monkeypatch):
     monkeypatch.delenv(operations.QKV_COMPUTE_PROFILE_ENV, raising=False)
@@ -126,6 +129,26 @@ def test_prefill_sliding_qkv_program_matches_accepted_geometry(monkeypatch):
             },
         )
     ]
+
+
+def test_prefill_sliding_qkv_program_leaves_global_projection_unchanged(monkeypatch):
+    monkeypatch.delenv(operations.QKV_COMPUTE_PROFILE_ENV, raising=False)
+    monkeypatch.setenv(operations.PREFILL_SLIDING_QKV_IN0_BLOCK_W_ENV, "10")
+    linear_calls = []
+    monkeypatch.setattr(
+        ttnn,
+        "linear",
+        lambda *args, **kwargs: linear_calls.append((args, kwargs)) or "output",
+    )
+
+    activation = _FakeActivation(_FakeDevice(), shape=(1, 1, 1024, 2560))
+    weights = SimpleNamespace(
+        wqkv=SimpleNamespace(shape=(1, 1, 2560, 6144)),
+        is_global=False,
+    )
+
+    assert operations.apply_qkv_projection(activation, weights) == "output"
+    assert linear_calls == [((activation, weights.wqkv), {"memory_config": None})]
 
 
 def test_prefill_sliding_output_program_matches_accepted_geometry(monkeypatch):

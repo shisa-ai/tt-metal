@@ -70,11 +70,11 @@ def _prefill_sliding_qkv_program_config(hidden_states, weights):
     hidden_size = int(hidden_states.shape[-1])
     weight_k = int(weights.wqkv.shape[-2])
     output_size = int(weights.wqkv.shape[-1])
-    if (
-        hidden_size != PREFILL_SLIDING_QKV_HIDDEN_SIZE
-        or weight_k != PREFILL_SLIDING_QKV_HIDDEN_SIZE
-        or output_size != PREFILL_SLIDING_QKV_OUTPUT_SIZE
-    ):
+    # ``weights.is_global`` describes KV tying, not the attention layer type.
+    # Use the projection width to leave the N=6144 global-QKV path untouched.
+    if output_size != PREFILL_SLIDING_QKV_OUTPUT_SIZE:
+        return None
+    if hidden_size != PREFILL_SLIDING_QKV_HIDDEN_SIZE or weight_k != PREFILL_SLIDING_QKV_HIDDEN_SIZE:
         raise ValueError(
             f"{PREFILL_SLIDING_QKV_IN0_BLOCK_W_ENV} requires the Chotto TP1 "
             f"M={PREFILL_SLIDING_QKV_SEQUENCE_LENGTH}, "
