@@ -196,16 +196,16 @@ def _prefill_gate_up_program_config(mesh_device, hidden_size, intermediate_size,
     n_tiles = intermediate_size // ttnn.TILE_SIZE
     core_count = grid.x * grid.y
     per_core_n = (n_tiles + core_count - 1) // core_count
-    return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
         compute_with_storage_grid_size=ttnn.CoreCoord(grid.x, grid.y),
         in0_block_w=in0_block_w,
         out_subblock_h=8,
         out_subblock_w=1,
         per_core_M=PREFILL_PROGRAM_SEQUENCE_LENGTH // ttnn.TILE_SIZE,
         per_core_N=per_core_n,
-        transpose_mcast=False,
         fused_activation=None,
         fuse_batch=False,
+        mcast_in0=True,
     )
 
 

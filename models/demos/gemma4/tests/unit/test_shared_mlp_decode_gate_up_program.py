@@ -123,7 +123,7 @@ def test_prefill_config_matches_accepted_automatic_geometry(monkeypatch):
     monkeypatch.setattr(shared_mlp.ttnn, "CoreCoord", lambda x, y: (x, y))
     monkeypatch.setattr(
         shared_mlp.ttnn,
-        "MatmulMultiCoreReuseMultiCastProgramConfig",
+        "MatmulMultiCoreReuseMultiCast1DProgramConfig",
         lambda **kwargs: captured.update(kwargs) or kwargs,
     )
     mesh = SimpleNamespace(compute_with_storage_grid_size=lambda: SimpleNamespace(x=8, y=9))
@@ -143,9 +143,9 @@ def test_prefill_config_matches_accepted_automatic_geometry(monkeypatch):
         "out_subblock_w": 1,
         "per_core_M": 32,
         "per_core_N": 5,
-        "transpose_mcast": False,
         "fused_activation": None,
         "fuse_batch": False,
+        "mcast_in0": True,
     }
 
 
