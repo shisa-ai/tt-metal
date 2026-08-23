@@ -13,5 +13,8 @@
   },
   "gemma-4-12B-it": {
     "default": {"shared_mlp": "bfp8", "attention": "bfp8"}
+  },
+  "e6cca0128d4fe1fcafbbcdb62dcbaf458b420af2": {
+    "1x4": {"shared_mlp": "bfp8"}
   }
 }
