@@ -304,12 +304,14 @@ class SharedMLP:
             or self.prefill_gate_up_in0_block_w is not None
             or self.decode_down_in0_block_w is not None
             or self.prefill_down_in0_block_w is not None
-        ) and tp > 2:
-            # TP1/TP2 are re-qualified for the decode selectors; TP4+ keeps
-            # the guard (wider shards shrink per-rank N to widths the tuned
-            # 1D-mcast configs have not been validated for). The prefill
+        ) and tp > 4:
+            # TP1/TP2/TP4 are re-qualified for the decode selectors; TP8+
+            # keeps the guard (wider shards shrink per-rank N to widths the
+            # tuned 1D-mcast configs have not been validated for). At TP4 the
+            # per-rank intermediate is 10240/4 = 2560, and the decode program
+            # configs below are sized to the per-rank shard. The prefill
             # program functions still hard-code the full TP1 geometry, so
-            # prefill widths remain TP1-only and raise there if set at TP2.
+            # prefill widths remain TP1-only and raise there if set at TP2+.
             raise ValueError("experimental shared-MLP selectors are currently qualified only for TP1/TP2")
         self.decode_gate_up_program_config = (
             _decode_gate_up_program_config(

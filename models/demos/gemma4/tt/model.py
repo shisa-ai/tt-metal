@@ -113,8 +113,13 @@ def _get_lm_head_program_config(mesh_device, m: int, k: int, n: int):
     #   - a non-last-token prefill slice (get_last_token==-1 -> M==seq_len) scales
     #     the output CB by M_tiles.
     # In those cases return None so ttnn.linear falls back to its default matmul
-    # heuristic, which blocks N/M to fit L1 (the pre-tuning behaviour).
-    if m_tiles > 1 or n > 64 * 1024:
+    # heuristic, which blocks N/M to fit L1 (the pre-tuning behaviour). The
+    # boundary is >= 64K (not > 64K): at TP4 per_device_vocab=262144/4=65536 is
+    # exactly 64K, where the pinned config's per-core CBs aggregate to ~2.13MB
+    # and overrun the ~1.5MB/core L1, so the exactly-64K case must also fall
+    # back. TP2 (131072 > 64K) already fell back; TP8 (32768 < 64K) keeps the
+    # tuned config.
+    if m_tiles > 1 or n >= 64 * 1024:
         return None
 
     per_core_n = max(1, (n_tiles + num_cores - 1) // num_cores)
