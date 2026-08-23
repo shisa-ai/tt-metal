@@ -1152,6 +1152,15 @@ class Gemma4Model:
         # decode region totals.
         if is_decode:
             signpost(header=LM_HEAD_SIGNPOST)
+        # Both-operand BFP8 prefill (03-c04): at prefill last-token the LM-head
+        # matmul is compute-bound (M=32 tile) and BFP8 x BFP8 runs at ~1.9x. The
+        # prefill hidden state is typecast to BFP8 before the matmul and the
+        # logits back to BF16 for the softcap. Decode stays weight-only (it is
+        # weight-read-bound). Mirrors the shared-MLP both-operand env.
+        both_operand = os.environ.get("GEMMA4_BOTH_OPERAND_PREFILL", "0") in ("1", "true", "on")
+        lm_head_both = both_operand and not is_decode and self.lm_head_weight is not None
+        if lm_head_both:
+            hidden_states = ttnn.typecast(hidden_states, ttnn.bfloat8_b)
         if self.lm_head_dram_sharded_weights:
             logits = self._apply_tp1_dram_sharded_lm_head(hidden_states)
             hidden_states.deallocate(True)
@@ -1166,6 +1175,11 @@ class Gemma4Model:
             hidden_states.deallocate(True)
         else:
             logits = hidden_states
+
+        if lm_head_both:
+            # BFP8 x BFP8 LM-head matmul output is BFP8; restore BF16 before the
+            # softcap (tanh on BFP8 would drift logits).
+            logits = ttnn.typecast(logits, ttnn.bfloat16)
 
         if self.final_logit_softcapping and self.final_logit_softcapping > 0:
             cap = self.final_logit_softcapping

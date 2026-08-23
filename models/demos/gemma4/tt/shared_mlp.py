@@ -21,6 +21,7 @@ from models.demos.gemma4.tt.ccl import ccl_allreduce
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
 
 FUSED_GATE_GELU_MUL_ENV = "GEMMA4_FUSED_SHARED_MLP_GATE_GELU_MUL"
+BOTH_OPERAND_PREFILL_ENV = "GEMMA4_BOTH_OPERAND_PREFILL"
 DECODE_GATE_UP_IN0_BLOCK_W_ENV = "GEMMA4_DECODE_SHARED_MLP_GATE_UP_IN0_BLOCK_W"
 PREFILL_GATE_UP_IN0_BLOCK_W_ENV = "GEMMA4_PREFILL_SHARED_MLP_GATE_UP_IN0_BLOCK_W"
 DECODE_DOWN_IN0_BLOCK_W_ENV = "GEMMA4_DECODE_SHARED_MLP_DOWN_IN0_BLOCK_W"
@@ -288,6 +289,14 @@ class SharedMLP:
         # full-width TP1 value.
         per_rank_intermediate = self.intermediate_size // tp if tp > 1 else self.intermediate_size
         self.fuse_gate_gelu_mul = _resolve_bool_env(FUSED_GATE_GELU_MUL_ENV, fuse_gate_gelu_mul)
+        # Both-operand BFP8 prefill (03-c04): typecast the prefill activation to
+        # BFP8 before the gate/up/down matmuls so BOTH operands are BFP8 and the
+        # matmul runs at BFP8's ~1.7x compute rate (BF16xBFP8 weight-only runs at
+        # BF16 rate). The 5 typecasts per layer measured 1.323x vs BF16 at M=256
+        # in the isolated layer probe. Weights are already BFP8 via the precision
+        # profile; this only quantizes the activations. Decode is left untouched
+        # (it is weight-read-bound, so weight-only already wins there).
+        self.both_operand_prefill = _resolve_bool_env(BOTH_OPERAND_PREFILL_ENV)
         self.decode_gate_up_in0_block_w = _resolve_decode_gate_up_in0_block_w(
             self.hidden_size, decode_gate_up_in0_block_w
         )
@@ -417,6 +426,14 @@ class SharedMLP:
         # gate = GELU(x @ gate_proj)
         is_decode = hidden_states.shape[-2] == ttnn.TILE_SIZE
         is_target_prefill = hidden_states.shape[-2] == PREFILL_PROGRAM_SEQUENCE_LENGTH
+        # Both-operand BFP8 prefill: quantize the activation for the gate/up
+        # matmuls (BFP8 x BFP8 = ~1.7x compute) and again for the down matmul,
+        # restoring BF16 at each boundary so the GeGLU multiply and the residual
+        # add stay in BF16 (numerically safe). The probe's both_conv pipeline
+        # measured 1.323x at M=256 with this exact 5-typecast pattern.
+        both_operand = self.both_operand_prefill and not is_decode
+        if both_operand:
+            hidden_states = ttnn.typecast(hidden_states, ttnn.bfloat8_b)
         if is_decode:
             gate_up_program_config = self.decode_gate_up_program_config
             down_program_config = self.decode_down_program_config
@@ -446,6 +463,12 @@ class SharedMLP:
                 program_config=gate_up_program_config,
             )
 
+        if both_operand:
+            # BFP8 x BFP8 matmul output is BFP8; restore BF16 for the GeGLU
+            # multiply (GELU on BFP8 would drift token selection).
+            gate = ttnn.typecast(gate, ttnn.bfloat16)
+            up = ttnn.typecast(up, ttnn.bfloat16)
+
         if self.fuse_gate_gelu_mul:
             hidden = ttnn.mul(
                 gate,
@@ -460,12 +483,19 @@ class SharedMLP:
         gate.deallocate(True)
         up.deallocate(True)
 
+        if both_operand:
+            hidden = ttnn.typecast(hidden, ttnn.bfloat8_b)
+
         # output = hidden @ down_proj
         if down_program_config is None:
             output = ttnn.linear(hidden, self.down_proj)
         else:
             output = ttnn.linear(hidden, self.down_proj, program_config=down_program_config)
         hidden.deallocate(True)
+
+        if both_operand:
+            # Restore BF16 for the residual add and the next layer.
+            output = ttnn.typecast(output, ttnn.bfloat16)
 
         # Allreduce after row-parallel down_proj
         if self.mesh_config is not None and self.mesh_config.tp > 1:
