@@ -281,6 +281,12 @@ class SharedMLP:
 
         tp = mesh_config.tp if mesh_config else 1
         tp_suffix = f"_tp{tp}" if tp > 1 else ""
+        # Column-parallel (gate/up output) and row-parallel (down input)
+        # shard the intermediate dimension evenly across TP ranks, so the
+        # per-rank intermediate width is intermediate_size // tp. The decode
+        # program configs below must be sized to the per-rank shard, not the
+        # full-width TP1 value.
+        per_rank_intermediate = self.intermediate_size // tp if tp > 1 else self.intermediate_size
         self.fuse_gate_gelu_mul = _resolve_bool_env(FUSED_GATE_GELU_MUL_ENV, fuse_gate_gelu_mul)
         self.decode_gate_up_in0_block_w = _resolve_decode_gate_up_in0_block_w(
             self.hidden_size, decode_gate_up_in0_block_w
@@ -298,13 +304,18 @@ class SharedMLP:
             or self.prefill_gate_up_in0_block_w is not None
             or self.decode_down_in0_block_w is not None
             or self.prefill_down_in0_block_w is not None
-        ) and tp != 1:
-            raise ValueError("experimental shared-MLP selectors are currently qualified only for TP1")
+        ) and tp > 2:
+            # TP1/TP2 are re-qualified for the decode selectors; TP4+ keeps
+            # the guard (wider shards shrink per-rank N to widths the tuned
+            # 1D-mcast configs have not been validated for). The prefill
+            # program functions still hard-code the full TP1 geometry, so
+            # prefill widths remain TP1-only and raise there if set at TP2.
+            raise ValueError("experimental shared-MLP selectors are currently qualified only for TP1/TP2")
         self.decode_gate_up_program_config = (
             _decode_gate_up_program_config(
                 mesh_device,
                 self.hidden_size,
-                self.intermediate_size,
+                per_rank_intermediate,
                 self.decode_gate_up_in0_block_w,
             )
             if self.decode_gate_up_in0_block_w is not None
@@ -323,7 +334,7 @@ class SharedMLP:
         self.decode_down_program_config = (
             _decode_down_program_config(
                 mesh_device,
-                self.intermediate_size,
+                per_rank_intermediate,
                 self.hidden_size,
                 self.decode_down_in0_block_w,
             )
