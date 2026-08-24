@@ -18,7 +18,16 @@ import os
 
 import ttnn
 
-_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "precision_overrides.json")
+_DEFAULT_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "precision_overrides.json",
+)
+# Serving processes import the model directly, without the repository parity
+# runners that can patch this module.  Resolve the externally owned policy at
+# import time so GEMMA4_PRECISION_PROFILE also reaches those entrypoints.  The
+# mutable _PATH remains for validated explicit runner overrides, which are
+# applied after import and therefore retain precedence.
+_PATH = os.environ.get("GEMMA4_PRECISION_PROFILE") or _DEFAULT_PATH
 
 # Module names that may be overridden — keep in sync with the JSON schema and
 # with the constructors that accept these kwargs (Gemma4Model and below).
@@ -77,6 +86,8 @@ class Gemma4Precision:
             with open(_PATH) as f:
                 table = json.load(f)
         except FileNotFoundError:
+            if os.path.abspath(_PATH) != os.path.abspath(_DEFAULT_PATH):
+                raise FileNotFoundError("configured Gemma4 precision profile does not exist: " f"{_PATH}")
             return cls({})
 
         model_entry = table.get(model_key)
