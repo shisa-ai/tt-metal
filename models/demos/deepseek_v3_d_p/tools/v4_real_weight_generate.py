@@ -91,7 +91,7 @@ def install_layer(ckpt: V4Checkpoint, layer, index: int, dtype, stats: list, laz
     return experts
 
 
-def decode(model, ids, position, tokens, on_token):
+def decode(model, ids, position, tokens, on_token, collect=None):
     """Prefill with cache, then greedy ``seq_len == 1`` steps.
 
     The cache is whatever the model builds for itself. Passing a stock ``DynamicCache()`` fails
@@ -110,6 +110,8 @@ def decode(model, ids, position, tokens, on_token):
         nxt = int(logits.argmax())
         first = {"logits_finite": bool(torch.isfinite(logits).all()), "top5": torch.topk(logits, 5).indices.tolist()}
         on_token(nxt, first)
+        if collect is not None:
+            collect.append(logits.clone())
         for step in range(1, tokens):
             pos = torch.full((1, 1), position + step, dtype=torch.long)
             out = model(input_ids=torch.tensor([[nxt]]), use_cache=True, past_key_values=cache, position_ids=pos)
@@ -119,6 +121,8 @@ def decode(model, ids, position, tokens, on_token):
                 nxt,
                 {"logits_finite": bool(torch.isfinite(logits).all()), "top5": torch.topk(logits, 5).indices.tolist()},
             )
+            if collect is not None:
+                collect.append(logits.clone())
     return first
 
 
@@ -129,6 +133,13 @@ def main() -> int:
     ap.add_argument("--layers", type=int, default=None, help="truncate the stack (smoke only)")
     ap.add_argument("--expect-first-token", type=int, default=None, help="guard: prefill argmax must equal this")
     ap.add_argument("--out", default=None)
+    ap.add_argument(
+        "--teacher-forcing-check",
+        type=int,
+        default=0,
+        help="after decoding N tokens, re-run ONE cache-free forward over prompt+generated "
+        "and compare the prediction at every position -- the standard cache-equivalence check",
+    )
     ap.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
     ap.add_argument(
         "--experts-implementation",
@@ -222,8 +233,9 @@ def main() -> int:
         if args.out:
             json.dump(result, open(args.out + ".partial", "w"), indent=1)
 
+    cached_logits: list[torch.Tensor] = []
     try:
-        decode(model, ids, prompt_tokens - 1, args.tokens, on_token)
+        decode(model, ids, prompt_tokens - 1, args.tokens, on_token, collect=cached_logits)
     finally:
         result["guard"] = guard
         result["generated_text"] = args.prompt + "".join(t["text"] for t in generated)
@@ -239,6 +251,64 @@ def main() -> int:
             json.dump(result, open(args.out, "w"), indent=1)
             print("wrote", args.out, flush=True)
         print("continuation:", repr(result["generated_text"][-160:]), flush=True)
+    if args.teacher_forcing_check:
+        n = min(args.teacher_forcing_check, len(generated))
+        seq = ids[0].tolist() + [g["id"] for g in generated[:n]]
+        print(f"teacher-forcing {n} generated tokens over {len(seq)} positions (cache off)", flush=True)
+        before = ck.bytes_read
+        with torch.no_grad():
+            ref = model(input_ids=torch.tensor([seq]), use_cache=False).logits[0].float()
+        rows, agree = [], 0
+        for step in range(n):
+            # Position prompt_tokens+step-1 predicts generated[step]; the cached run produced
+            # it from that same prefix, so agreement at every step is cache equivalence.
+            pos = prompt_tokens + step - 1
+            predicted = int(ref[pos].argmax())
+            match = predicted == generated[step]["id"]
+            agree += match
+            rows.append(
+                {
+                    "step": step,
+                    "position": pos,
+                    "cached_id": generated[step]["id"],
+                    "teacher_forced_id": predicted,
+                    "match": match,
+                    "cached_text": generated[step]["text"],
+                    "teacher_forced_text": tok.decode([predicted]),
+                }
+            )
+            if step < len(cached_logits):
+                # Argmax agreement alone cannot tell a broken cache from a near-tie: a truncated
+                # stack produces almost-degenerate logits, and fp32 reduction order differs
+                # between a [1, S] prefill and a [1, 1] decode. Compare the vectors -- a cache
+                # error moves the whole distribution, a tie flips one id among near-equals.
+                a, b = cached_logits[step], ref[pos]
+                top2 = torch.topk(b, 2)
+                rows[-1].update(
+                    forced_margin=round(float(top2.values[0] - top2.values[1]), 4),
+                    logit_max_abs_delta=round(float((a - b).abs().max()), 5),
+                    logit_cosine=round(float(torch.nn.functional.cosine_similarity(a, b, dim=0)), 6),
+                    cached_top5=torch.topk(a, 5).indices.tolist(),
+                    forced_top5=top2.indices.tolist(),
+                )
+            print(
+                f"  step {step}: cached {generated[step]['id']} {generated[step]['text']!r} vs "
+                f"forced {predicted} {tok.decode([predicted])!r} {'OK' if match else 'MISMATCH'} "
+                f"margin={rows[-1].get('forced_margin')} dlogit={rows[-1].get('logit_max_abs_delta')} "
+                f"cos={rows[-1].get('logit_cosine')}",
+                flush=True,
+            )
+        result["teacher_forcing"] = {
+            "checked": n,
+            "agreements": agree,
+            "all_match": agree == n,
+            "bytes_read_gib": round((ck.bytes_read - before) / 2**30, 2),
+            "rows": rows,
+        }
+        print(f"teacher-forcing agreement: {agree}/{n}", flush=True)
+        if args.out:
+            json.dump(result, open(args.out, "w"), indent=1)
+
     return 0 if guard["passed"] is not False else 1
 
 
