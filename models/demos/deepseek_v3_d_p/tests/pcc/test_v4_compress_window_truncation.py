@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 
-"""Where the cached and cache-free reference paths stop being the same model.
+"""A real asymmetry in the reference -- and a warning about mis-attributing it.
+
+Pins two facts: the cache's own bookkeeping is chunk-size invariant, and the compressors'
+``cache_layer is None`` branch silently discards the partial window. The first version of this
+file also asserted that the second fact *explained* the cached-decode divergence measured in
+worklog 6e5e0d. It does not: ``use_cache=False`` on this model still builds a
+``DynamicCache(config=self.config)`` internally, so that comparison never reached the branch.
+The divergence is between two cached executions. Both facts below still hold -- they are just
+not the cause.
 
 Observed while generating real completions with the released weights (worklog 6e5e0d): cached
 decode and a cache-free forward over the *same* token prefix agree at cosine 1.0 for a
@@ -148,9 +156,18 @@ def test_cached_path_keeps_what_the_no_cache_branch_throws_away(cfg):
     assert cache.entry_count["compressor"] == 13 // rate
 
     # The no-cache branch returns no remainder by construction: one path has consumed 12 tokens
-    # and forgotten one, the other has consumed 12 and is holding one. That difference *is* the
-    # cached-vs-forward divergence measured in worklog 6e5e0d, and it is why a cache-free rerun
-    # cannot serve as its own control.
+    # and forgotten one, the other has consumed 12 and is holding one.
+    #
+    # What this is NOT: the explanation of the cached-decode vs one-shot-forward divergence in
+    # worklog 6e5e0d. That claim was made here and retracted in a later entry. `use_cache=False`
+    # does not reach this branch on this model -- DeepseekV4Model.forward does
+    #     return_cache = past_key_values if use_cache else None
+    #     if past_key_values is None:
+    #         past_key_values = DynamicCache(config=self.config)
+    # so use_cache governs only what is *returned*, and every forward in that comparison had a
+    # model-built cache. Verified directly: the cache-free-labelled and fresh-cache control modes
+    # produce identical argmax and identical margins at all 24 positions. The branch is real and
+    # this test pins it; it was simply never on the path being measured.
     assert (13 // rate) * rate == 12
 
 
