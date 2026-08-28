@@ -16,6 +16,15 @@ decode-side correctness, and none of it is visible in a single-shot prefill test
   the untruncated concatenation, and shares one tensor for keys and values because V4 is
   shared-KV MQA.
 
+This state is not optional plumbing. Asking the released reference to decode with a generic
+``DynamicCache()`` dies on the first compressed layer with
+``'DynamicLayer' object has no attribute 'store_compression_weights'`` -- the model builds its
+own cache from its own config (``DynamicCache(config=self.config)``, which is what gives each
+layer a ``DeepseekV4HCACache`` / ``DeepseekV4CSACache``), and the modelling file's own note
+rules out ``StaticCache`` for the same reason. Measured with the released weights on host while
+generating ``tools/v4_real_weight_generate.py``. So a device decoder has to carry this state
+wherever its cache lives; there is no generic cache to inherit.
+
 Host-only bookkeeping on torch tensors; the device layout is a separate decision. Nothing
 here has run on hardware.
 """
