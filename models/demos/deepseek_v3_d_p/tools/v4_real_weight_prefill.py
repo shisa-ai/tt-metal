@@ -101,7 +101,11 @@ def main() -> int:
     ap.add_argument("--snapshot", default=None)
     ap.add_argument("--prompt-file", default=None, help="text file; stdin if omitted")
     ap.add_argument("--prompt", default=None)
-    ap.add_argument("--steps", type=int, default=0, help="extra greedy tokens, teacher-forced")
+    ap.add_argument(
+        "--prompts-file",
+        default=None,
+        help="JSON list of prompts; each is an independent prefill (one streaming pass each)",
+    )
     ap.add_argument("--layers", type=int, default=None, help="truncate the stack (plumbing smoke only)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--max-prompt-tokens", type=int, default=256)
@@ -115,11 +119,13 @@ def main() -> int:
         cfg.num_hidden_layers = args.layers
     ckpt = V4Checkpoint(snap)
 
-    text = args.prompt if args.prompt is not None else (open(args.prompt_file).read() if args.prompt_file else "")
+    if args.prompts_file:
+        prompts = json.load(open(args.prompts_file))
+    else:
+        prompts = [
+            args.prompt if args.prompt is not None else (open(args.prompt_file).read() if args.prompt_file else "")
+        ]
     tok = AutoTokenizer.from_pretrained(snap, trust_remote_code=True)
-    enc = tok(text, return_tensors="pt", truncation=True, max_length=args.max_prompt_tokens)
-    ids = enc["input_ids"]
-    print(f"prompt: {ids.shape[1]} tokens, vocab sample {ids[0, :6].tolist()}", flush=True)
 
     t0 = time.time()
     model = build(cfg, torch.float32)
@@ -133,32 +139,56 @@ def main() -> int:
             set_param(model, load.reference_name(name), ckpt.dequantized(name, torch.float32))
     print(f"model-level tensors loaded ({time.time() - t0:.0f} s)", flush=True)
 
-    timing, peak = [], 0
-    for i, layer in enumerate(model.model.layers):
+    def install_hooks():
+        for i, layer in enumerate(model.model.layers):
 
-        def pre(mod, a, kw, i=i):
-            t = time.time()
-            for ref, tensor in load.iter_reference_layer(ckpt, i, dtype=torch.float32):
-                set_param(mod, ref, tensor)
-            timing.append({"layer": i, "load_s": round(time.time() - t, 2), "bytes_read": ckpt.bytes_read})
-            print(
-                f"  layer {i:2d} loaded in {time.time() - t:5.1f} s " f"({ckpt.bytes_read / 2**30:.1f} GiB read)",
-                flush=True,
-            )
+            def pre(mod, a, kw, i=i):
+                t = time.time()
+                for ref, tensor in load.iter_reference_layer(ckpt, i, dtype=torch.float32):
+                    set_param(mod, ref, tensor)
+                timing.append({"layer": i, "load_s": round(time.time() - t, 2)})
+                print(
+                    f"  layer {i:2d} loaded in {time.time() - t:5.1f} s " f"({ckpt.bytes_read / 2**30:.1f} GiB read)",
+                    flush=True,
+                )
 
-        def post(mod, a, kw, out, i=i):
-            free_module_params(mod)
-            gc.collect()
+            def post(mod, a, kw, out):
+                free_module_params(mod)
+                gc.collect()
 
-        layer.register_forward_pre_hook(pre, with_kwargs=True)
-        layer.register_forward_hook(post, with_kwargs=True)
+            layer.register_forward_pre_hook(pre, with_kwargs=True)
+            layer.register_forward_hook(post, with_kwargs=True)
 
-    result = {"snapshot": os.path.basename(snap.rstrip("/")), "prompt_tokens": int(ids.shape[1]), "layers": []}
-    with torch.no_grad():
-        out = model(input_ids=ids, use_cache=False)
-        logits = out.logits[0, -1].float()
+    timing, results = [], []
+    install_hooks()
+
+    def dump():
+        """Write after every prompt: an 18-minute pass must not be all-or-nothing."""
+        if not args.out:
+            return
+        os.makedirs(os.path.dirname(args.out), exist_ok=True)
+        json.dump(
+            {
+                "snapshot": os.path.basename(snap.rstrip("/")),
+                "layers": cfg.num_hidden_layers,
+                "elapsed_s": round(time.time() - t0, 1),
+                "bytes_read_gib": round(ckpt.bytes_read / 2**30, 2),
+                "per_layer_load_s": [x["load_s"] for x in timing],
+                "results": results,
+            },
+            open(args.out + ".partial", "w"),
+            indent=1,
+        )
+
+    for pi, text in enumerate(prompts):
+        ids = tok(text, return_tensors="pt", truncation=True, max_length=args.max_prompt_tokens)["input_ids"]
+        print(f"prompt {pi}: {ids.shape[1]} tokens ({text[:48]!r})", flush=True)
+        with torch.no_grad():
+            logits = model(input_ids=ids, use_cache=False).logits[0, -1].float()
         top = torch.topk(logits, 5)
-        first = {
+        entry = {
+            "prompt": text,
+            "prompt_tokens": int(ids.shape[1]),
             "argmax_token": int(logits.argmax()),
             "argmax_text": tok.decode([int(logits.argmax())]),
             "top5": [
@@ -167,29 +197,20 @@ def main() -> int:
             ],
             "logits_finite": bool(torch.isfinite(logits).all()),
             "logit_absmax": round(float(logits.abs().max()), 3),
+            "elapsed_s": round(time.time() - t0, 1),
         }
-        result["prefill"] = first
+        results.append(entry)
         print(
-            f"prefill done after {time.time() - t0:.0f} s: argmax={first['argmax_token']} "
-            f"({first['argmax_text']!r}) finite={first['logits_finite']}",
+            f"prompt {pi} -> {entry['argmax_token']} {entry['argmax_text']!r} "
+            f"finite={entry['logits_finite']} ({entry['elapsed_s']} s)",
             flush=True,
         )
+        dump()
 
-        generated = ids
-        for step in range(args.steps):
-            out = model(input_ids=generated, use_cache=False)
-            nxt = int(out.logits[0, -1].argmax())
-            generated = torch.cat([generated, torch.tensor([[nxt]])], dim=1)
-            result["layers"].append({"step": step, "token": nxt, "text": tok.decode([nxt])})
-            print(f"step {step}: {nxt} {tok.decode([nxt])!r} ({time.time() - t0:.0f} s)", flush=True)
-
-    result["timing_s"] = round(time.time() - t0, 1)
-    result["per_layer_load_s"] = [t["load_s"] for t in timing]
-    result["bytes_read_gib"] = round(ckpt.bytes_read / 2**30, 2)
-    print(f"total {result['timing_s']} s, read {result['bytes_read_gib']} GiB", flush=True)
+    result = {"results": results}
+    print(f"total {round(time.time() - t0, 1)} s, read {round(ckpt.bytes_read / 2**30, 2)} GiB", flush=True)
     if args.out:
-        os.makedirs(os.path.dirname(args.out), exist_ok=True)
-        json.dump(result, open(args.out, "w"), indent=1)
+        os.replace(args.out + ".partial", args.out)
         print("wrote", args.out, flush=True)
     return 0
 
