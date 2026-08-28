@@ -91,10 +91,21 @@ def install_layer(ckpt: V4Checkpoint, layer, index: int, dtype, stats: list, laz
     return experts
 
 
-def decode(model, cache, ids, position, tokens, on_token):
-    """Prefill with cache, then greedy ``seq_len == 1`` steps."""
+def decode(model, ids, position, tokens, on_token):
+    """Prefill with cache, then greedy ``seq_len == 1`` steps.
+
+    The cache is whatever the model builds for itself. Passing a stock ``DynamicCache()`` fails
+    with ``'DynamicLayer' object has no attribute 'store_compression_weights'``: V4 keeps
+    compressor state on the *per-layer* cache (``DeepseekV4HCACache`` / ``DeepseekV4CSACache``),
+    and the model only constructs those when it creates the cache from its own config
+    (``DynamicCache(config=self.config)``). That per-layer compression state is precisely what
+    the device port has to reproduce, so it is worth knowing the reference will not accept a
+    generic cache -- and that ``StaticCache`` is ruled out by the same comment in the modelling
+    file.
+    """
     with torch.no_grad():
-        out = model(input_ids=ids, use_cache=True, past_key_values=cache)
+        out = model(input_ids=ids, use_cache=True)
+        cache = out.past_key_values
         logits = out.logits[0, -1].float()
         nxt = int(logits.argmax())
         first = {"logits_finite": bool(torch.isfinite(logits).all()), "top5": torch.topk(logits, 5).indices.tolist()}
@@ -132,7 +143,7 @@ def main() -> int:
     if snap is None:
         print("no snapshot; set DS4_V4_FLASH_DIR", file=sys.stderr)
         return 2
-    from transformers import AutoConfig, DynamicCache
+    from transformers import AutoConfig
 
     cfg = AutoConfig.from_pretrained(snap, trust_remote_code=True)
     if args.layers:
@@ -212,7 +223,7 @@ def main() -> int:
             json.dump(result, open(args.out + ".partial", "w"), indent=1)
 
     try:
-        decode(model, DynamicCache(), ids, prompt_tokens - 1, args.tokens, on_token)
+        decode(model, ids, prompt_tokens - 1, args.tokens, on_token)
     finally:
         result["guard"] = guard
         result["generated_text"] = args.prompt + "".join(t["text"] for t in generated)
