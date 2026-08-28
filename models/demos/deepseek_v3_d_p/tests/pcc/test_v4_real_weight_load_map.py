@@ -179,3 +179,39 @@ def test_gate_and_up_stack_in_the_reference_chunk_order(ckpt, model):
     err = (acted.float() - expected.float()).abs().max().item()
     assert err < 1e-2, f"stacked gate/up disagrees with the reference chunk order: {err:.3e}"
     assert down.shape[0] * down.shape[1] == down.numel(), "down_proj should stay [H, I]"
+
+
+def test_lazy_expert_stack_reproduces_what_the_loader_stacks(ckpt):
+    """The lazy path must be the *same* composition, not a second interpretation of w1/w2/w3.
+
+    Decode reads ``gate_up_proj[e]`` for the 6 experts a token hits, so a lazy stand-in can
+    replace a ~6 GiB stack with ~100 MB. That is only safe if it composes identically: gate
+    and up on the output axis in w1-then-w3 order. Getting that pair backwards is silent --
+    SwiGLU still runs and produces a different function -- so the check is equality with the
+    loader's own stacked tensor, on two experts, rather than a restatement of the rule.
+    """
+    import gc
+
+    from models.demos.deepseek_v3_d_p.tt.v4_weight_load import LazyExpertStack, iter_reference_layer
+
+    layer = next(i for i in range(43) if any("ffn.experts.0.w1.weight" in n for n in ckpt.layer_names(i)))
+    stacked = {}
+    for ref_name, tensor in iter_reference_layer(ckpt, layer, dtype=torch.float32):
+        if ref_name in ("mlp.experts.gate_up_proj", "mlp.experts.down_proj"):
+            stacked[ref_name.split(".")[-1]] = tensor
+    assert set(stacked) == {"gate_up_proj", "down_proj"}, f"loader offered {sorted(stacked)}"
+
+    stacks = {
+        "gate_up": LazyExpertStack(ckpt, layer, "gate_up"),
+        "down": LazyExpertStack(ckpt, layer, "down"),
+    }
+    pairs = {"gate_up": stacked["gate_up_proj"], "down": stacked["down_proj"]}
+    for role, full in pairs.items():
+        for expert in (0, 3):
+            piece = stacks[role][expert]
+            assert tuple(piece.shape) == tuple(full[expert].shape), f"{role}[{expert}] shape"
+            assert torch.equal(piece, full[expert]), f"{role}[{expert}] differs from the loader's stack"
+        assert stacks[role].materializations == 2, "the one-entry cache must not materialise per lookup"
+        assert stacks[role].bytes_read < full.numel(), "lazy reads must move far fewer bytes than the stack"
+    del stacked, pairs
+    gc.collect()

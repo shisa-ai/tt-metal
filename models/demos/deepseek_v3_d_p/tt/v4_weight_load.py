@@ -276,7 +276,63 @@ def iter_reference_layer(
         yield "mlp.experts.down_proj", down
 
 
+class LazyExpertStack:
+    """Stand-in for a stacked expert parameter that materialises one expert at a time.
+
+    ``iter_reference_layer`` builds the whole ``[n_experts, ...]`` stack because a prefill
+    touches most experts. Decode does not: ``Experts.forward`` hits the routed experts a
+    token actually selected, and indexes the stack once per hit
+    (``self.gate_up_proj[expert_idx]``), never as a matrix. So holding all ~6.4 GiB per layer
+    to use 6 of them is what makes host decode look impossible when it is only wasteful.
+
+    This object supplies exactly what that line asks for: ``stack[e]`` reads expert ``e`` and
+    composes it with the same rule as :func:`iter_reference_layer` -- gate and up stacked on
+    the output axis in ``w1``-then-``w3`` order, down from ``w2``. The order is not
+    interchangeable (reversing the pair silently changes SwiGLU), so it is asserted against
+    the loader's own output in ``tests/pcc/test_v4_real_weight_load_map.py`` rather than restated.
+
+    A one-entry cache is kept because greedy decode revisits popular experts across steps;
+    it is deliberately tiny, since a full cache is the thing being avoided.
+    """
+
+    def __init__(self, ckpt: V4Checkpoint, layer: int, role: str, *, dtype=torch.float32, cache: int = 1):
+        if role not in ("gate_up", "down"):
+            raise ValueError(f"role must be 'gate_up' or 'down', got {role!r}")
+        self.ckpt, self.layer, self.role, self.dtype = ckpt, layer, role, dtype
+        self.cache, self._cached_id, self._cached = cache, None, None
+        self.materializations = 0
+        self.bytes_read = 0
+
+    def _expert_names(self, expert: int) -> tuple[str, ...]:
+        prefix = f"layers.{self.layer}.ffn.experts.{expert}."
+        names = tuple(prefix + w + ".weight" for w in (EXPERT_WEIGHTS))
+        missing = [n for n in names if n not in self.ckpt.index]
+        if missing:
+            raise KeyError(f"layer {self.layer} expert {expert}: missing {missing}")
+        return names
+
+    def __getitem__(self, expert: int) -> torch.Tensor:
+        if not isinstance(expert, int):
+            expert = int(expert)
+        if self._cached is not None and expert == self._cached_id:
+            return self._cached
+        before = self.ckpt.bytes_read
+        w1, w2, w3 = (self.ckpt.dequantized(n, self.dtype) for n in self._expert_names(expert))
+        self.materializations += 1
+        self.bytes_read += self.ckpt.bytes_read - before
+        # Same composition as iter_reference_layer: gate then up on the output axis, because
+        # nn.Linear concatenates them in that order and the swap is silent.
+        out = torch.cat([w1, w3], dim=0) if self.role == "gate_up" else w2
+        if self.cache:
+            self._cached_id, self._cached = expert, out
+        return out
+
+    def __repr__(self) -> str:
+        return f"LazyExpertStack(layer={self.layer}, role={self.role!r}, reads={self.materializations})"
+
+
 __all__ = [
+    "LazyExpertStack",
     "LAYER_ALIASES",
     "MODEL_ALIASES",
     "DERIVED_REFERENCE_NAMES",
