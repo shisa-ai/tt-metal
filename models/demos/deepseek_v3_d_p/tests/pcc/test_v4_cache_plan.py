@@ -17,6 +17,8 @@ construction time, which is exactly when the assembly would have failed.
 
 from __future__ import annotations
 
+import pytest
+
 from models.demos.deepseek_v3_d_p.tt.v4_cache import TtCompressionCache
 from models.demos.deepseek_v3_d_p.tt.v4_model_config import CSA, HCA, SLIDING, V4ModelArgs
 
