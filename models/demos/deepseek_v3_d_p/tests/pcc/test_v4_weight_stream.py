@@ -16,11 +16,17 @@ import pytest
 import torch
 
 from models.demos.deepseek_v3_d_p.tt import v4_weight_prep as prep
-from models.demos.deepseek_v3_d_p.tt.v4_weight_stream import V4Checkpoint, _narrow_scale, scale_sibling
+from models.demos.deepseek_v3_d_p.tt.v4_weight_stream import (
+    V4Checkpoint,
+    _narrow_scale,
+    default_snapshot_dir,
+    scale_sibling,
+)
 
-SNAP = os.environ.get("DS4_V4_FLASH_DIR")
+SNAP = default_snapshot_dir()
 needs_ckpt = pytest.mark.skipif(
-    not SNAP or not os.path.isdir(SNAP), reason="set DS4_V4_FLASH_DIR to the V4-Flash snapshot"
+    not SNAP or not os.path.isdir(SNAP),
+    reason="no V4-Flash snapshot (set DS4_V4_FLASH_DIR or download the model)",
 )
 
 #: Measured fact from the header inventory, so index drift is a loud failure.

@@ -75,6 +75,30 @@ def scale_sibling(weight_name: str) -> str:
     return weight_name[: -len(".weight")] + ".scale" if weight_name.endswith(".weight") else ""
 
 
+def default_snapshot_dir(env_var: str = "DS4_V4_FLASH_DIR") -> str | None:
+    """Locate an unpacked V4-Flash snapshot, or ``None`` when there is none.
+
+    ``env_var`` wins. Otherwise the Hugging Face cache is probed, because that is where the
+    weights actually live on a machine that downloaded them, and a real-weight test gated on
+    an environment variable nobody exports is a test that silently never runs -- which is how
+    snapshot-integrity contracts stayed skipped on a host holding all 156 GB.
+
+    Only directory existence is checked; opening the snapshot is the caller's business so a
+    missing-shard failure stays attributable.
+    """
+    explicit = os.environ.get(env_var)
+    if explicit and os.path.isdir(explicit):
+        return explicit
+    cache = os.path.expanduser("~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots")
+    if os.path.isdir(cache):
+        snaps = sorted(
+            os.path.join(cache, name) for name in os.listdir(cache) if os.path.isdir(os.path.join(cache, name))
+        )
+        if snaps:
+            return snaps[-1]
+    return None
+
+
 class V4Checkpoint:
     """Header-indexed, payload-lazy view of an unpacked V4-Flash snapshot.
 

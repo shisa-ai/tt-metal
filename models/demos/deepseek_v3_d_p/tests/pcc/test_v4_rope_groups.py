@@ -20,10 +20,11 @@ from models.demos.deepseek_v3_d_p.reference.deepseek_v4.configuration_deepseek_v
 from models.demos.deepseek_v3_d_p.tt import v4_rope
 from models.demos.deepseek_v3_d_p.tt.v4_model_config import V4ModelArgs
 from models.demos.deepseek_v3_d_p.tt.v4_sliding_attention import TtV4SlidingAttention
+from models.demos.deepseek_v3_d_p.tt.v4_weight_stream import default_snapshot_dir
 
-SNAP = os.environ.get("DS4_V4_FLASH_DIR")
+SNAP = default_snapshot_dir()
 needs_ckpt = pytest.mark.skipif(
-    not SNAP or not os.path.isdir(SNAP), reason="set DS4_V4_FLASH_DIR to the V4-Flash snapshot"
+    not SNAP or not os.path.isdir(SNAP), reason="no V4-Flash snapshot (set DS4_V4_FLASH_DIR or download the model)"
 )
 
 HEAD_DIM = 512

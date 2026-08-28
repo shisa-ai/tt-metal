@@ -16,8 +16,9 @@ from transformers import AutoConfig
 
 from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Indexer
 from models.demos.deepseek_v3_d_p.tt.v4_indexer import TtIndexer, causal_entry_threshold, index_scores, select_top_k
+from models.demos.deepseek_v3_d_p.tt.v4_weight_stream import default_snapshot_dir
 
-CHECKPOINT = "/home/ubuntu/.cache/huggingface/hub/" "models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots"
+SNAP = default_snapshot_dir()
 
 RATE = 4
 INDEX_HEAD_DIM = 128
@@ -28,13 +29,11 @@ HIDDEN = 4096
 
 
 def checkpoint_config():
-    import glob
-    import os
+    pass
 
-    snapshots = sorted(glob.glob(os.path.join(CHECKPOINT, "*")))
-    if not snapshots:
-        pytest.skip("V4-Flash checkpoint config not present")
-    return AutoConfig.from_pretrained(snapshots[-1], trust_remote_code=True)
+    if SNAP is None:
+        pytest.skip("V4-Flash checkpoint not present")
+    return AutoConfig.from_pretrained(SNAP, trust_remote_code=True)
 
 
 class RecordingScorer(torch.nn.Module):

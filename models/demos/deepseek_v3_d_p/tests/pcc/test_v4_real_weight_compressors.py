@@ -22,7 +22,6 @@ skipped on a machine that has the weights.
 No device is involved. Parity is fp32 on CPU, with a bf16 agreement check as an observation.
 """
 
-import os
 
 import pytest
 import torch
@@ -35,25 +34,9 @@ from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 imp
 )
 from models.demos.deepseek_v3_d_p.tt.v4_compression import TtCSACompressor, TtHCACompressor
 from models.demos.deepseek_v3_d_p.tt.v4_indexer import TtIndexer
-from models.demos.deepseek_v3_d_p.tt.v4_weight_stream import V4Checkpoint
+from models.demos.deepseek_v3_d_p.tt.v4_weight_stream import V4Checkpoint, default_snapshot_dir
 
-HF_CACHE = os.path.expanduser("~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots")
-
-
-def resolve_snapshot():
-    explicit = os.environ.get("DS4_V4_FLASH_DIR")
-    if explicit and os.path.isdir(explicit):
-        return explicit
-    if os.path.isdir(HF_CACHE):
-        snaps = sorted(
-            os.path.join(HF_CACHE, d) for d in os.listdir(HF_CACHE) if os.path.isdir(os.path.join(HF_CACHE, d))
-        )
-        if snaps:
-            return snaps[-1]
-    return None
-
-
-SNAP = resolve_snapshot()
+SNAP = default_snapshot_dir()
 pytestmark = pytest.mark.skipif(SNAP is None, reason="V4-Flash snapshot not present")
 
 HIDDEN = 4096

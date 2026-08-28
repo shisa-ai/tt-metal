@@ -20,8 +20,9 @@ from transformers import AutoConfig
 
 from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 import DeepseekV4CSACompressor
 from models.demos.deepseek_v3_d_p.tt.v4_compression import TtCSACompressor, compress_windows_csa, sparse_selection_bias
+from models.demos.deepseek_v3_d_p.tt.v4_weight_stream import default_snapshot_dir
 
-CHECKPOINT = "/home/ubuntu/.cache/huggingface/hub/" "models--deepseek-ai--DeepSeek-V4-Flash-0731/snapshots"
+SNAP = default_snapshot_dir()
 
 HEAD_DIM = 512
 RATE = 4
@@ -35,13 +36,10 @@ def checkpoint_config():
     to construct or silently changes what is being tested; the released config also pins
     ``compress_rates`` and the rope groups to the shipped values.
     """
-    import glob
-    import os
 
-    snapshots = sorted(glob.glob(os.path.join(CHECKPOINT, "*")))
-    if not snapshots:
-        pytest.skip("V4-Flash checkpoint config not present")
-    return AutoConfig.from_pretrained(snapshots[-1], trust_remote_code=True)
+    if SNAP is None:
+        pytest.skip("V4-Flash checkpoint not present")
+    return AutoConfig.from_pretrained(SNAP, trust_remote_code=True)
 
 
 def filled_reference(seed=13):
