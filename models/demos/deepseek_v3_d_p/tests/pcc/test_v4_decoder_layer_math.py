@@ -191,22 +191,65 @@ def test_comb_transpose_is_load_bearing():
     )
 
 
-def test_reference_init_comb_is_symmetric_so_init_parity_cannot_catch_it(block):
-    """Documents a blind spot rather than hiding it.
+def _fresh_layer(seed: int):
+    """Build the block with RNG pinned immediately before construction.
 
-    If this ever stops holding, the assertion in the test above becomes the only
-    thing guarding the transpose at init-parity too, and this file should be
-    revisited.
+    The module-scoped `block` fixture is NOT reproducible for this question: three
+    identical runs of this file gave skip / pass / skip, because global RNG state at
+    fixture creation depends on what ran before it. Anything that asks "is comb
+    symmetric at init?" must seed at the point of construction.
     """
-    cfg, lay, streams = block
+    args = V4ModelArgs.tiny(1)
+    cfg = DeepseekV4Config(**args.drive_reference().__dict__)
+    torch.manual_seed(seed)
+    lay = DeepseekV4DecoderLayer(cfg, layer_idx=0).to(torch.float32).eval()
+    # The reference's _init_weights does NOT fill mhc.base (nor several others):
+    # two builds under the same seed differed by 1.86e+37 in attn_hc.base, i.e. the
+    # mHC residual mixing came from uninitialised memory. Anything comparing against
+    # this block must set them, or the oracle is not reproducible run to run.
+    g = torch.Generator().manual_seed(seed)
+    for name, mod in (("attn_hc", lay.attn_hc), ("ffn_hc", lay.ffn_hc)):
+        with torch.no_grad():
+            for pname in ("base", "scale", "fn"):
+                param = getattr(mod, pname)
+                if pname == "base":
+                    param.normal_(0.0, 0.02, generator=g)
+                elif pname == "scale":
+                    param.fill_(1.0)
+                else:
+                    param.normal_(0.0, 0.02, generator=g)
+    return cfg, lay
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_init_comb_may_be_symmetric_so_init_parity_is_not_a_reliable_guard(seed):
+    """An un-transposed comb can be invisible at initialisation -- deterministically checked.
+
+    Not "skip if symmetric": the hazard IS that detection depends on initialisation,
+    so this measures symmetry per seed and records it. The load-bearing assertion
+    lives in the synthetic asymmetric-comb test, which is reproducible.
+    """
+    cfg, lay = _fresh_layer(seed)
+    b, s, hc, d = 1, 4, cfg.hc_mult, cfg.hidden_size
+    torch.manual_seed(seed + 100)
+    streams = torch.randn(b, s, hc, d)
     with torch.no_grad():
-        _, comb, _ = lay.attn_hc(streams)  # reference HyperConnection returns 3
-        sym = torch.allclose(comb, comb.transpose(-1, -2), atol=1e-6)
-    if sym:
-        pytest.skip(
-            "comb is symmetric at this initialisation: init-time parity cannot "
-            "detect an un-transposed comb, so device parity must use asymmetric "
-            "(trained-like) comb weights"
+        _, comb, _ = lay.attn_hc(streams)
+    symmetric = bool(torch.allclose(comb, comb.transpose(-1, -2), atol=1e-6))
+
+    # Whatever the answer, it must be reproducible for this seed.
+    cfg2, lay2 = _fresh_layer(seed)
+    with torch.no_grad():
+        _, comb2, _ = lay2.attn_hc(streams)
+    assert torch.equal(comb, comb2), "comb is not reproducible for a fixed seed -- fixture is unsafe"
+    assert bool(torch.allclose(comb2, comb2.transpose(-1, -2), atol=1e-6)) == symmetric
+
+    if symmetric:
+        import warnings
+        warnings.warn(
+            f"seed {seed}: comb is symmetric at init, so init-time parity cannot "
+            "detect an un-transposed comb for this initialisation",
+            stacklevel=2,
         )
 
 
