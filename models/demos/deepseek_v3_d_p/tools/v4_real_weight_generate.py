@@ -133,9 +133,11 @@ def main() -> int:
     ap.add_argument(
         "--teacher-force-ids",
         default=None,
-        help="comma-separated token ids: skip decoding entirely and run ONE cache-free forward "
+        help="comma-separated token ids: skip decoding entirely and run ONE one-shot forward "
         "over them, writing per-position argmax/top-5 for offline comparison against a cached "
-        "run. Separate invocation on purpose -- calling the cache-free path on a model that "
+        "run. use_cache=False here does NOT make it cacheless (the model builds its own cache), "
+        "so it is a second cached execution, not a cache-free one. Separate invocation on "
+        "purpose -- calling this path on a model that "
         "has already decoded with a cache dies with \"'DynamicCache' object is not "
         'subscriptable", so sharing a process would contaminate the control.',
     )
@@ -145,12 +147,13 @@ def main() -> int:
         "--per-prefix-golden",
         type=int,
         default=0,
-        help="greedy decode where EVERY step is one cache-free forward over the actual prefix. "
-        "Deterministic and independent of call boundaries, but NOT equivalent to cached decode: "
-        "the cache-free branch of the CSA/HCA compressors drops the tokens past the last whole "
-        "compression window, so every step after an aligned prefix silently ignores the newest "
-        "1-3 tokens (see tests/pcc/test_v4_compress_window_truncation.py). Kept as the control "
-        "that measures that gap, not as a golden.",
+        help="greedy decode where EVERY step is one one-shot forward over the actual prefix. "
+        "Deterministic and independent of call boundaries, but NOT equivalent to incremental cached "
+        "decode. Its stated reason for that was wrong and is retracted: this mode lets the "
+        "model build a cache, so the compressors' cache_layer-is-None truncation is never "
+        "reached and no trailing tokens are dropped (worklog e3838b). What it does measure is "
+        "chunk-sensitivity inside the cached path -- one chunk per step versus one token per "
+        "step -- which diverges at released geometry. Kept as that control, not as a golden.",
     )
     ap.add_argument(
         "--fresh-cache-control-ids",
@@ -158,15 +161,17 @@ def main() -> int:
         help="comma-separated token ids: ONE forward over the whole sequence with a fresh "
         "model-built cache, reporting per-position argmax/top-5. This is the end-to-end test of "
         "the chunk-invariance invariant at real geometry -- cached one-shot versus cached "
-        "incremental decode. Distinct from --teacher-force-ids, which runs use_cache=False and "
-        "therefore hits the truncating compressor branch.",
+        "incremental decode. Distinct from --teacher-force-ids only in the flag it passes: both "
+        "get a model-built cache, and measured over the same 24 ids they agree at 24/24 "
+        "positions with bit-identical margins, so they are the same computation.",
     )
     ap.add_argument("--out", default=None)
     ap.add_argument(
         "--teacher-forcing-check",
         type=int,
         default=0,
-        help="after decoding N tokens, re-run ONE cache-free forward over prompt+generated "
+        help="after decoding N tokens, re-run ONE one-shot forward (with a model-built cache) "
+        "over prompt+generated "
         "and compare the prediction at every position -- the standard cache-equivalence check",
     )
     ap.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
@@ -307,16 +312,20 @@ def main() -> int:
     print(f"prompt: {prompt_tokens} tokens {args.prompt!r}", flush=True)
 
     if args.per_prefix_golden:
-        # Each step re-runs the whole prefix with no cache. Quadratic and slow, on purpose: the
+        # Each step re-runs the whole prefix in ONE call, with a fresh model-built cache. (An
+        # earlier version of this comment said "with no cache"; it was wrong, and the mode is
+        # identical to --fresh-cache-control-ids in what it computes.) Quadratic and slow, on purpose: the
         # value at position len(seq)-1 comes from one forward over exactly the tokens that
         # precede it, so no call boundary or cache state can influence it.
         #
-        # It is NOT the canonical greedy. `cache_layer is None` in both compressors keeps only
-        # `(L // rate) * rate` tokens, so for a 13-token prefix at rate 4 the newest token is
-        # projected and then discarded. That makes this the right instrument to *measure* the
-        # cache-free/cache gap with, and the wrong one to serve as a parity target: the cached
-        # path is what a serving stack actually computes, and it is chunk-size invariant
-        # (asserted in tests/pcc/test_v4_compress_window_truncation.py).
+        # It is NOT the canonical greedy, and not for the reason first written here. The retracted
+        # reading blamed the compressors' `cache_layer is None` branch (`(L // rate) * rate` tokens,
+        # discarding a partial window) -- real code, never reached: every forward here passes a
+        # cache, so nothing is dropped. The live reading, from worklog e3838b: this mode and the
+        # incremental decode are BOTH cached and still disagree at 43 layers (cosine 1.0 at the
+        # aligned step, 0.47-0.83 after), so the gap is how the compressor/attention path behaves
+        # across call boundaries. Cache bookkeeping alone is chunk-invariant
+        # (tests/pcc/test_v4_compress_window_truncation.py), which is what makes the gap interesting.
         seq = ids[0].tolist()
         prefix_rows = []
         for step in range(args.per_prefix_golden):
