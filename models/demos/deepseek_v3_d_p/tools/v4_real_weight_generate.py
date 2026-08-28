@@ -152,6 +152,15 @@ def main() -> int:
         "1-3 tokens (see tests/pcc/test_v4_compress_window_truncation.py). Kept as the control "
         "that measures that gap, not as a golden.",
     )
+    ap.add_argument(
+        "--fresh-cache-control-ids",
+        default=None,
+        help="comma-separated token ids: ONE forward over the whole sequence with a fresh "
+        "model-built cache, reporting per-position argmax/top-5. This is the end-to-end test of "
+        "the chunk-invariance invariant at real geometry -- cached one-shot versus cached "
+        "incremental decode. Distinct from --teacher-force-ids, which runs use_cache=False and "
+        "therefore hits the truncating compressor branch.",
+    )
     ap.add_argument("--out", default=None)
     ap.add_argument(
         "--teacher-forcing-check",
@@ -247,6 +256,49 @@ def main() -> int:
         }
         if args.out:
             json.dump(out, open(args.out, "w"), indent=1)
+            print("wrote", args.out, flush=True)
+        return 0
+
+    if args.fresh_cache_control_ids:
+        seq = [int(x) for x in args.fresh_cache_control_ids.split(",")]
+        print(f"fresh-cache one-shot control over {len(seq)} ids", flush=True)
+        with torch.no_grad():
+            # No past_key_values: the model builds DynamicCache(config=self.config) itself, so
+            # every layer gets its HCA/CSA cache class. One call means one chunk -- the thing
+            # being compared against incremental decode.
+            out = model(input_ids=torch.tensor([seq]), use_cache=True)
+        rows = []
+        for pos in range(len(seq)):
+            top = torch.topk(out.logits[0, pos], 5)
+            rows.append(
+                {
+                    "position": pos,
+                    "input_id": seq[pos],
+                    "argmax": int(out.logits[0, pos].argmax()),
+                    "argmax_text": tok.decode([int(out.logits[0, pos].argmax())]),
+                    "margin_top2": round(float(top.values[0] - top.values[1]), 4),
+                    "top5": [
+                        {"id": int(i), "text": tok.decode([int(i)]), "logit": round(float(v), 4)}
+                        for i, v in zip(top.indices.tolist(), top.values.tolist())
+                    ],
+                }
+            )
+            print(
+                f"  pos {pos:2d} argmax {rows[-1]['argmax']:6d} {rows[-1]['argmax_text']!r:12s} "
+                f"margin={rows[-1]['margin_top2']}",
+                flush=True,
+            )
+        payload = {
+            "mode": "fresh_cache_one_shot",
+            "layers": cfg.num_hidden_layers,
+            "dtype": args.dtype,
+            "seq": seq,
+            "rows": rows,
+            "bytes_read_gib": round(ck.bytes_read / 2**30, 2),
+            "elapsed_s": round(time.time() - t0, 1),
+        }
+        if args.out:
+            json.dump(payload, open(args.out, "w"), indent=1)
             print("wrote", args.out, flush=True)
         return 0
 
