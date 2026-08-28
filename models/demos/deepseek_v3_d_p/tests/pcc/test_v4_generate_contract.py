@@ -60,7 +60,20 @@ def greedy(model, cfg, prompt: torch.Tensor, steps: int):
 
 
 def teacher_forced(model, prompt: torch.Tensor, generated: list[int]) -> torch.Tensor:
-    """One cacheless forward over prompt + already-generated tokens; last-position logits."""
+    """One forward over prompt + already-generated tokens, with a *fresh* cache.
+
+    The helper used to be documented as "cacheless" and is not: ``model(seq)`` leaves
+    ``use_cache`` at its default, so the model builds ``DynamicCache(config=self.config)`` and
+    each layer gets its ``DeepseekV4HCACache`` / ``DeepseekV4CSACache``. So what this suite
+    actually proves is **cached one-shot == cached incremental** -- the chunk-invariance
+    invariant -- and its green is meaningful, not vacuous.
+
+    Passing ``use_cache=False`` instead would make the name honest and the test fail: the
+    compressors' ``cache_layer is None`` branch keeps only ``(L // rate) * rate`` tokens, so a
+    genuinely cacheless forward drops the tokens past the last whole compression window
+    (``tests/pcc/test_v4_compress_window_truncation.py``). Measured on the released weights,
+    that is the difference between cosine 1.0 and cosine 0.47.
+    """
     seq = prompt.clone()
     if generated:
         extra = torch.tensor([generated], device=prompt.device, dtype=seq.dtype)
