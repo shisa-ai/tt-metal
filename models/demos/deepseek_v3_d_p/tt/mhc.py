@@ -66,7 +66,7 @@ class _HCBase:
         explicit.
         """
         sq = ttnn.multiply(x, x)
-        mean = ttnn.mean(sq, dim=-1, keep_dim=True, memory_config=memory_config)
+        mean = ttnn.mean(sq, dim=-1, keepdim=True, memory_config=memory_config)
         ttnn.deallocate(sq)
         denom = ttnn.rsqrt(ttnn.add(mean, eps, memory_config=memory_config), memory_config=memory_config)
         ttnn.deallocate(mean)
@@ -107,14 +107,23 @@ class TtHCMapping(_HCBase):
         hc = self.hc_mult
         mix = (2 + hc) * hc
 
-        # `fn` is [mix, H*D] in torch (F.linear consumes x @ fn.T). TTNN linear
-        # wants the transposed, 4-D weight form used elsewhere in this demo.
-        self.fn = ttnn.from_torch(
-            weights["fn"].detach().transpose(-2, -1).contiguous().unsqueeze(0).unsqueeze(0),
-            dtype=weights_dtype,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        # Three separate weights rather than one [mix, H*D] weight plus a slice.
+        # A single linear would produce 24 columns and splitting a *tiled* tensor
+        # at 4/4/16 is not tile-aligned (TTNN tiles are 32 wide), so the slice
+        # cannot be expressed. Splitting the weight on the host is mathematically
+        # identical -- every output still contracts the full H*D -- and each
+        # branch stays a legal tile shape. It costs two extra kernel launches.
+        fn = weights["fn"].detach()
+        parts = torch.split(fn, [hc, hc, hc * hc], dim=0)
+        self.fn_pre, self.fn_post, self.fn_comb = (
+            ttnn.from_torch(
+                p.transpose(-2, -1).contiguous().unsqueeze(0).unsqueeze(0),
+                dtype=weights_dtype,
+                layout=ttnn.TILE_LAYOUT,
+                device=device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            for p in parts
         )
         # base / scale stay small and replicated; bias folds into the linear.
         self.base = weights["base"].detach().float().clone()
@@ -123,18 +132,24 @@ class TtHCMapping(_HCBase):
     def mapping(self, flat_norm: ttnn.Tensor):
         """Return ``(pre_logits, post_logits, comb_logits)`` from the normed flat.
 
-        Splitting is along the last dim in ``[H, H, H*H]`` order, matching the
-        reference's ``.split([hc, hc, hc*hc], dim=-1)``.
+        Three linears on the pre-split weights, so nothing has to slice a tiled
+        tensor at a non-tile boundary. ``comb_logits`` comes back as
+        ``[B, S, H, H]`` because the reference adds its bias only after viewing
+        the logits as ``[..., hc, hc]``.
         """
         hc = self.hc_mult
-        wide = ttnn.linear(
-            flat_norm, self.fn, compute_kernel_config=self.compute_config, memory_config=self.memory_config
+        # ttnn Shape supports integer indexing but NOT slicing, so read the
+        # extents by index rather than slicing the shape tuple.
+        b, s = flat_norm.shape[0], flat_norm.shape[1]
+        pre_w = ttnn.linear(
+            flat_norm, self.fn_pre, compute_kernel_config=self.compute_config, memory_config=self.memory_config
         )
-        out_w = wide.shape[-1]
-        pre_w = ttnn.slice(wide, [0, 0, 0, 0], [*wide.shape[:3], hc])
-        post_w = ttnn.slice(wide, [0, 0, 0, hc], [*wide.shape[:3], 2 * hc])
-        comb_w = ttnn.slice(wide, [0, 0, 0, 2 * hc], [*wide.shape[:3], out_w])
-        ttnn.deallocate(wide)
+        post_w = ttnn.linear(
+            flat_norm, self.fn_post, compute_kernel_config=self.compute_config, memory_config=self.memory_config
+        )
+        comb_w = ttnn.linear(
+            flat_norm, self.fn_comb, compute_kernel_config=self.compute_config, memory_config=self.memory_config
+        )
 
         # Each of the three outputs has its own learned scalar, then its own bias
         # slice -- reference applies `* scale` before `+ base`.
@@ -143,29 +158,25 @@ class TtHCMapping(_HCBase):
 
         pre_logits = ttnn.add(
             ttnn.multiply(pre_w, float(pre_s), memory_config=self.memory_config),
-            _as_bias(pre_b, pre_w.shape, self.device, self.memory_config),
+            _as_bias(pre_b, self.device, self.memory_config),
             memory_config=self.memory_config,
         )
         post_logits = ttnn.add(
             ttnn.multiply(post_w, float(post_s), memory_config=self.memory_config),
-            _as_bias(post_b, post_w.shape, self.device, self.memory_config),
+            _as_bias(post_b, self.device, self.memory_config),
             memory_config=self.memory_config,
         )
-        # Reference order: view as [..., hc, hc] -> scale -> bias. Both the
-        # reshape and the order matter: `comb_b.view(hc, hc)` must not be added
-        # to the flat [H*H] slice.
+        # Reference order: view as [..., hc, hc] -> scale -> bias. The reshape
+        # must keep batch and sequence (volume b*s*H*H), so it is [b,s,H,H].
         comb_logits = ttnn.add(
             ttnn.multiply(
-                ttnn.reshape(comb_w, [*comb_w.shape[:2], hc, hc]),
+                ttnn.reshape(comb_w, [b, s, hc, hc]),
                 float(comb_s),
                 memory_config=self.memory_config,
             ),
-            _as_bias(comb_b.reshape(hc, hc), comb_w.shape, self.device, self.memory_config),
+            _as_bias(comb_b.reshape(hc, hc), self.device, self.memory_config),
             memory_config=self.memory_config,
         )
-        ttnn.deallocate(comb_w)
-        for t in (pre_w, post_w):
-            ttnn.deallocate(t)
         return pre_logits, post_logits, comb_logits
 
     def forward(self, hidden_streams: ttnn.Tensor):
@@ -193,19 +204,16 @@ class TtHCMapping(_HCBase):
         pre = ttnn.add(
             ttnn.sigmoid(pre_logits, memory_config=self.memory_config), eps, memory_config=self.memory_config
         )
-        ttnn.deallocate(pre_logits)
 
         # post = 2 * sigmoid(logits)   (note: no eps on this branch)
         post = ttnn.multiply(
             ttnn.sigmoid(post_logits, memory_config=self.memory_config), 2.0, memory_config=self.memory_config
         )
-        ttnn.deallocate(post_logits)
 
         # comb = softmax(-1) + eps, then Sinkhorn-Knopp row/col normalisation.
         comb = ttnn.add(
             ttnn.softmax(comb_logits, dim=-1, memory_config=self.memory_config), eps, memory_config=self.memory_config
         )
-        ttnn.deallocate(comb_logits)
         comb = self.sinkhorn(comb)
 
         # collapsed = sum_h pre[h] * streams[h]  -> [B, S, 1, D]
@@ -278,7 +286,7 @@ class TtHyperHead(_HCBase):
             ttnn.sigmoid(
                 ttnn.add(
                     ttnn.multiply(mixes, self.scale, memory_config=self.memory_config),
-                    _as_bias(self.base, mixes.shape, self.device, self.memory_config),
+                    _as_bias(self.base, self.device, self.memory_config),
                     memory_config=self.memory_config,
                 ),
                 memory_config=self.memory_config,
@@ -334,16 +342,19 @@ def apply_mhc_site(
 
 
 def _normalize_axis(t: ttnn.Tensor, axis: int, eps: float, device, mc):
-    """``t / (sum(t, axis, keepdim=True) + eps)``."""
-    total = ttnn.sum(t, dim=axis, keep_dim=True, memory_config=mc)
-    total = ttnn.add(total, eps, memory_config=mc)
-    out = ttnn.multiply(t, ttnn.reciprocal(total, memory_config=mc), memory_config=mc)
-    ttnn.deallocate(total)
-    return out
+    """``t / (sum(t, axis, keepdim=True) + eps)``.
+
+    Uses a real ``divide`` rather than ``multiply(t, reciprocal(total))``. The
+    reciprocal form measured worse on device: Sinkhorn applies this 40 times per
+    token (column, then 19 x (row, column)) and the two-roundings-per-step error
+    compounds across all 40.
+    """
+    total = ttnn.sum(t, dim=axis, keepdim=True, memory_config=mc)
+    return ttnn.divide(t, ttnn.add(total, eps, memory_config=mc), memory_config=mc)
 
 
-def _as_bias(vec: torch.Tensor, target_shape, device, mc) -> ttnn.Tensor:
-    """A small 1-D parameter broadcast against a ``[..., n]`` activation."""
+def _as_bias(vec: torch.Tensor, device, mc) -> ttnn.Tensor:
+    """A small parameter broadcast against a ``[..., n]`` activation."""
     shape = [1, 1, 1, -1] if vec.ndim == 1 else [1, 1, *vec.shape[:-1], vec.shape[-1]]
     return ttnn.from_torch(
         vec.reshape(shape).to(torch.bfloat16),
