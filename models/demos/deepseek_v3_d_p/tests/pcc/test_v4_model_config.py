@@ -16,8 +16,8 @@ architecture than the model.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
-import pytest
 import torch
 
 from models.demos.deepseek_v3_d_p.reference.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
@@ -108,17 +108,18 @@ def test_tiny_preset_builds_a_generating_oracle():
     assert torch.equal(gen[0, :8], ids[0]), "generate did not preserve the prompt prefix"
 
 
-def test_unknown_schedule_is_rejected_not_silently_defaulted():
+def test_unknown_schedule_is_rejected_not_silently_defaulted(expect_error):
     args = V4ModelArgs(**{**V4ModelArgs.tiny(2).__dict__, "schedule": "sliding"})
-    with pytest.raises(ValueError, match="sliding"):
+    with expect_error(ValueError, "sliding"):
         args.layer_types()
 
 
 # ---- mapping onto upstream's MoE gate -------------------------------------- #
 
-GATE_SOURCE = (
-    "models/demos/deepseek_v3_d_p/tt/moe/tt_moe_gate_prefill.py"
-)
+GATE_SOURCE = Path(__file__).resolve().parents[2] / "tt/moe/tt_moe_gate_prefill.py"
+"""Absolute on purpose. A repo-root-relative path here makes the test pass only when
+pytest is invoked from the tt-metal root and fail from the demo directory, which is a
+trap for anyone running the suite from here."""
 
 
 def test_gate_cfg_covers_every_key_the_gate_actually_reads():
@@ -129,7 +130,6 @@ def test_gate_cfg_covers_every_key_the_gate_actually_reads():
     time -- which is the kind of failure that only shows up on hardware.
     """
     import re
-    from pathlib import Path
 
     text = Path(GATE_SOURCE).read_text()
     reads = set(re.findall(r"model_cfg\.([A-Z][A-Z0-9_]*)", text))

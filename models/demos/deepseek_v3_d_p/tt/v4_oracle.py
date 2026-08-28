@@ -127,21 +127,36 @@ def weight_fingerprint(model: torch.nn.Module) -> str:
     return h.hexdigest()
 
 
+def initialize_reference_params(module: torch.nn.Module, seed: int = 0, num_experts: int = 8) -> None:
+    """Overwrite **every** parameter and buffer of a constructed reference module.
+
+    Reference module classes allocate their parameters with ``torch.empty``, and the
+    ``_init_weights`` machinery that would fill them only runs under
+    ``from_pretrained``/``init_empty_weights`` flows. A bare
+    ``DeepseekV4DecoderLayer(cfg, layer_idx=0)`` therefore leaves ``attn_hc.base``,
+    ``attn_hc.fn``, ``attn_hc.scale`` and friends holding whatever bytes the allocator
+    happened to be holding. Two same-seed builds differ by ~1.9e+37, and if that memory
+    occurs to be NaN every downstream comparison silently becomes non-deterministic.
+
+    Anything that constructs reference modules directly must call this. It is the same
+    fill the oracle uses, so parity tests and the oracle agree by construction rather
+    than by coincidence.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    for name, t in _walk_state(module):
+        _fill_tensor(t, gen, name, num_experts=num_experts)
+
+
 def build_reference_oracle(args: "V4ModelArgs", seed: int = 0, dtype: torch.dtype = torch.float32):
     """Build the tiny/preset reference model with fully explicit weights.
 
     Returns ``(model, fingerprint)``. Same ``args`` + same ``seed`` must give the
     same fingerprint; assert it in the run record.
     """
-    from models.demos.deepseek_v3_d_p.reference.deepseek_v4.configuration_deepseek_v4 import (
-        DeepseekV4Config,
-    )
-    from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 import (
-        DeepseekV4ForCausalLM,
-    )
+    from models.demos.deepseek_v3_d_p.reference.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+    from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 
     cfg = DeepseekV4Config(**args.drive_reference().__dict__)
-    gen = torch.Generator().manual_seed(seed)
 
     # Materialise the module tree with no RNG dependence at all, then fill
     # everything ourselves; HF init is not trusted to be complete.
@@ -149,8 +164,7 @@ def build_reference_oracle(args: "V4ModelArgs", seed: int = 0, dtype: torch.dtyp
         model = DeepseekV4ForCausalLM(cfg)
     model = model.to_empty(device="cpu").to(dtype).eval()
 
-    for name, t in _walk_state(model):
-        _fill_tensor(t, gen, name, num_experts=cfg.num_local_experts)
+    initialize_reference_params(model, seed=seed, num_experts=cfg.num_local_experts)
 
     return model, weight_fingerprint(model)
 

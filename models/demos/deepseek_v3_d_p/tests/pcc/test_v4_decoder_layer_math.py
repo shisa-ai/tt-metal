@@ -32,7 +32,7 @@ import torch
 from models.demos.deepseek_v3_d_p.reference.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 import DeepseekV4DecoderLayer
 from models.demos.deepseek_v3_d_p.tt.v4_model_config import V4ModelArgs
-
+from models.demos.deepseek_v3_d_p.tt.v4_oracle import initialize_reference_params
 
 # ---- transcription of tt/mhc.py::apply_mhc_site -----------------------------
 
@@ -101,6 +101,13 @@ def block():
     cfg = DeepseekV4Config(**args.drive_reference().__dict__)
     torch.manual_seed(0)
     lay = DeepseekV4DecoderLayer(cfg, layer_idx=0).to(torch.float32).eval()
+    # Construction alone leaves most parameters as torch.empty, and this fixture drives
+    # the whole block composition, so every parameter is read. Without the explicit fill
+    # this test compared through uninitialised memory and only failed when that memory
+    # happened to hold NaN -- it passed for weeks by luck, not by correctness. Seeding
+    # global RNG before construction is not enough: the reference classes never fill
+    # attn_hc.base/fn/scale at all.
+    initialize_reference_params(lay, seed=0, num_experts=cfg.num_local_experts)
     b, s, hc, d = 1, 4, cfg.hc_mult, cfg.hidden_size
     torch.manual_seed(1)
     streams = torch.randn(b, s, hc, d)
@@ -109,6 +116,7 @@ def block():
 
 def _reference_block(lay, streams, seed_attn=11, seed_mlp=12):
     """Run the reference's own forward with sublayers stubbed out."""
+
     class Stub(torch.nn.Module):
         def __init__(self, seed, as_tuple):
             super().__init__()
@@ -159,9 +167,9 @@ def test_block_returns_a_stream_stack_not_a_single_hidden_state(block):
     with torch.no_grad():
         out = _mirror_block(lay, streams)
     assert out.dim() == 4, tuple(out.shape)
-    assert out.shape == streams.shape, (
-        f"block must carry [B,S,hc_mult,D] = {tuple(streams.shape)}, got {tuple(out.shape)}"
-    )
+    assert (
+        out.shape == streams.shape
+    ), f"block must carry [B,S,hc_mult,D] = {tuple(streams.shape)}, got {tuple(out.shape)}"
 
 
 def test_comb_transpose_is_load_bearing():
@@ -186,8 +194,7 @@ def test_comb_transpose_is_load_bearing():
     wrong = mix_in_untransposed(post, comb, streams, out)
     assert right.shape == wrong.shape
     assert not torch.allclose(right, wrong, rtol=1e-4, atol=1e-6), (
-        "mix_in cannot distinguish comb from comb^T -- the transpose is not "
-        "actually applied"
+        "mix_in cannot distinguish comb from comb^T -- the transpose is not " "actually applied"
     )
 
 
@@ -246,6 +253,7 @@ def test_init_comb_may_be_symmetric_so_init_parity_is_not_a_reliable_guard(seed)
 
     if symmetric:
         import warnings
+
         warnings.warn(
             f"seed {seed}: comb is symmetric at init, so init-time parity cannot "
             "detect an un-transposed comb for this initialisation",
