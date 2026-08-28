@@ -130,6 +130,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--prompt", default="The capital of France is Paris. The capital of Germany is")
     ap.add_argument("--tokens", type=int, default=16)
+    ap.add_argument(
+        "--teacher-force-ids",
+        default=None,
+        help="comma-separated token ids: skip decoding entirely and run ONE cache-free forward "
+        "over them, writing per-position argmax/top-5 for offline comparison against a cached "
+        "run. Separate invocation on purpose -- calling the cache-free path on a model that "
+        "has already decoded with a cache dies with \"'DynamicCache' object is not "
+        'subscriptable", so sharing a process would contaminate the control.',
+    )
     ap.add_argument("--layers", type=int, default=None, help="truncate the stack (smoke only)")
     ap.add_argument("--expect-first-token", type=int, default=None, help="guard: prefill argmax must equal this")
     ap.add_argument("--out", default=None)
@@ -190,6 +199,46 @@ def main() -> int:
     )
 
     tok = AutoTokenizer.from_pretrained(snap, trust_remote_code=True)
+    if args.teacher_force_ids:
+        seq = [int(x) for x in args.teacher_force_ids.split(",")]
+        print(f"teacher-forcing {len(seq)} ids, cache off", flush=True)
+        with torch.no_grad():
+            lg = model(input_ids=torch.tensor([seq]), use_cache=False).logits[0].float()
+        rows = []
+        for pos in range(len(seq)):
+            top = torch.topk(lg[pos], 5)
+            rows.append(
+                {
+                    "position": pos,
+                    "input_id": seq[pos],
+                    "argmax": int(lg[pos].argmax()),
+                    "argmax_text": tok.decode([int(lg[pos].argmax())]),
+                    "margin_top2": round(float(top.values[0] - top.values[1]), 4),
+                    "top5": [
+                        {"id": int(i), "text": tok.decode([int(i)]), "logit": round(float(v), 4)}
+                        for i, v in zip(top.indices.tolist(), top.values.tolist())
+                    ],
+                }
+            )
+            print(
+                f"  pos {pos:2d} argmax {rows[-1]['argmax']:6d} {rows[-1]['argmax_text']!r:12s} "
+                f"margin={rows[-1]['margin_top2']}",
+                flush=True,
+            )
+        out = {
+            "mode": "teacher_forced_cache_free",
+            "layers": cfg.num_hidden_layers,
+            "dtype": args.dtype,
+            "seq": seq,
+            "rows": rows,
+            "bytes_read_gib": round(ck.bytes_read / 2**30, 2),
+            "elapsed_s": round(time.time() - t0, 1),
+        }
+        if args.out:
+            json.dump(out, open(args.out, "w"), indent=1)
+            print("wrote", args.out, flush=True)
+        return 0
+
     ids = tok(args.prompt, return_tensors="pt", truncation=True, max_length=512)["input_ids"]
     prompt_tokens = int(ids.shape[1])
     print(f"prompt: {prompt_tokens} tokens {args.prompt!r}", flush=True)
