@@ -102,7 +102,7 @@ def install_layer(
     return experts
 
 
-def decode(model, ids, position, tokens, on_token, collect=None):
+def decode(model, ids, position, tokens, on_token, collect=None, pass_position_ids: bool = True):
     """Prefill with cache, then greedy ``seq_len == 1`` steps.
 
     The cache is whatever the model builds for itself. Passing a stock ``DynamicCache()`` fails
@@ -124,7 +124,7 @@ def decode(model, ids, position, tokens, on_token, collect=None):
         if collect is not None:
             collect.append(logits.clone())
         for step in range(1, tokens):
-            pos = torch.full((1, 1), position + step, dtype=torch.long)
+            pos = torch.full((1, 1), position + step, dtype=torch.long) if pass_position_ids else None
             out = model(input_ids=torch.tensor([[nxt]]), use_cache=True, past_key_values=cache, position_ids=pos)
             logits = out.logits[0, -1].float()
             nxt = int(logits.argmax())
@@ -153,6 +153,14 @@ def main() -> int:
         'subscriptable", so sharing a process would contaminate the control.',
     )
     ap.add_argument("--layers", type=int, default=None, help="truncate the stack (smoke only)")
+    ap.add_argument(
+        "--no-explicit-position-ids",
+        action="store_true",
+        help="omit position_ids on decode steps and let the model derive them from the cache "
+        "length. The oracle suite and the preset probe never pass them, so this separates "
+        "'the two schedules compute differently' from 'the harness tells the model something "
+        "the oracle does not'.",
+    )
     ap.add_argument(
         "--no-compressors",
         action="store_true",
@@ -451,7 +459,15 @@ def main() -> int:
 
     cached_logits: list[torch.Tensor] = []
     try:
-        decode(model, ids, prompt_tokens - 1, args.tokens, on_token, collect=cached_logits)
+        decode(
+            model,
+            ids,
+            prompt_tokens - 1,
+            args.tokens,
+            on_token,
+            collect=cached_logits,
+            pass_position_ids=not args.no_explicit_position_ids,
+        )
     finally:
         result["guard"] = guard
         result["generated_text"] = args.prompt + "".join(t["text"] for t in generated)
