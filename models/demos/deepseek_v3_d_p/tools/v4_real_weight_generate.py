@@ -105,14 +105,20 @@ def install_layer(
 def decode(model, ids, position, tokens, on_token, collect=None, pass_position_ids: bool = True):
     """Prefill with cache, then greedy ``seq_len == 1`` steps.
 
-    The cache is whatever the model builds for itself. Passing a stock ``DynamicCache()`` fails
-    with ``'DynamicLayer' object has no attribute 'store_compression_weights'``: V4 keeps
-    compressor state on the *per-layer* cache (``DeepseekV4HCACache`` / ``DeepseekV4CSACache``),
-    and the model only constructs those when it creates the cache from its own config
-    (``DynamicCache(config=self.config)``). That per-layer compression state is precisely what
-    the device port has to reproduce, so it is worth knowing the reference will not accept a
-    generic cache -- and that ``StaticCache`` is ruled out by the same comment in the modelling
-    file.
+    The caller must build the cache and pass it into the prefill -- a ``DynamicCache`` constructed
+    with the model's config, then handed to every subsequent step. Two constraints look similar and
+    are not the same, and conflating them cost a day:
+
+    * **Type.** A stock ``DynamicCache()`` fails with ``'DynamicLayer' object has no attribute
+      'store_compression_weights'``: V4 keeps compressor state on the *per-layer* cache
+      (``DeepseekV4HCACache`` / ``DeepseekV4CSACache``), which only exists when the cache is built
+      from the model config. ``StaticCache`` is ruled out by a comment in the modelling file. This
+      per-layer state is exactly what the device port has to reproduce.
+    * **Ownership.** Do *not* let the model build the cache and then reuse ``out.past_key_values``.
+      That object satisfies the type constraint yet silently fails to carry per-layer state across
+      forwards, so each decode step attends only its own token. It is invisible in a loss-value
+      test and in any suite that passes its own cache in. See ``P05-SW-002`` and
+      ``v4_cache_pattern_probe.py``.
     """
     # The cache MUST be created by the caller and passed into the prefill. Letting the model build
     # it and then reusing out.past_key_values silently loses per-layer state between forwards: the
