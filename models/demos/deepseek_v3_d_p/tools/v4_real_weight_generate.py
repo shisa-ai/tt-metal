@@ -114,9 +114,17 @@ def decode(model, ids, position, tokens, on_token, collect=None, pass_position_i
     generic cache -- and that ``StaticCache`` is ruled out by the same comment in the modelling
     file.
     """
+    # The cache MUST be created by the caller and passed into the prefill. Letting the model build
+    # it and then reusing out.past_key_values silently loses per-layer state between forwards: the
+    # sliding layer's update is handed 1 token and returns 1 key, so every decode step attends only
+    # itself. Measured at preset scale (20260828, no checkpoint needed): that pattern gives cosine
+    # 0.496/0.419/0.285 against a recompute while the caller-created cache gives 1.000000 with
+    # max|dlogit| ~1e-7. This is why the oracle suite, which passes a cache in, never saw it.
+    from transformers import DynamicCache
+
     with torch.no_grad():
-        out = model(input_ids=ids, use_cache=True)
-        cache = out.past_key_values
+        cache = DynamicCache(config=model.config)
+        out = model(input_ids=ids, use_cache=True, past_key_values=cache)
         logits = out.logits[0, -1].float()
         nxt = int(logits.argmax())
         first = {"logits_finite": bool(torch.isfinite(logits).all()), "top5": torch.topk(logits, 5).indices.tolist()}
