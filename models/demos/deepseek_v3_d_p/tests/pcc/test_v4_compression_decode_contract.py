@@ -4,7 +4,8 @@
 """HCA/CSA stateful compression must agree between one-shot and incremental decode.
 
 This is the highest-risk piece of the port and it is the one thing upstream never
-exercises: `TtHCA`/`TtCSA`/`TtIndexer` are never instantiated at 1×1, and our pin's
+exercises: `TtHCA`/`TtIndexer` are never instantiated at 1×1 (`TtCSA` does not
+exists at all — worklog 928348), and our pin's
 whole V4 demo is disabled with `serialize_layernorms` unsupported (worklog 86ec0e).
 The compressor is *stateful across calls* — it buffers partial windows, emits an
 entry only when a window closes, and stamps each entry with a deterministic absolute
