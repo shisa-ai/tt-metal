@@ -68,11 +68,13 @@ def teacher_forced(model, prompt: torch.Tensor, generated: list[int]) -> torch.T
     actually proves is **cached one-shot == cached incremental** -- the chunk-invariance
     invariant -- and its green is meaningful, not vacuous.
 
-    Passing ``use_cache=False`` instead would make the name honest and the test fail: the
-    compressors' ``cache_layer is None`` branch keeps only ``(L // rate) * rate`` tokens, so a
-    genuinely cacheless forward drops the tokens past the last whole compression window
-    (``tests/pcc/test_v4_compress_window_truncation.py``). Measured on the released weights,
-    that is the difference between cosine 1.0 and cosine 0.47.
+    Passing ``use_cache=False`` would NOT make the name honest: on this model that flag only
+    suppresses the cache in the *return value*, so the forward is unchanged and this assertion
+    would still pass. The truncating ``cache_layer is None`` branch is reachable only by driving
+    a compressor with no cache at all -- which is what
+    ``tests/pcc/test_v4_compress_window_truncation.py`` does at module level, never through
+    ``forward``. Measured directly on the released weights: the cache-free-labelled and
+    fresh-cache control modes agree at 24/24 positions with bit-identical margins.
     """
     seq = prompt.clone()
     if generated:
