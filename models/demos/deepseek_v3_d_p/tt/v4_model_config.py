@@ -75,6 +75,24 @@ def _interleave(n_layers: int, first_two_hca: bool = True) -> list[str]:
 
 
 @dataclass(frozen=True)
+class LayerCachePlan:
+    """What one layer owns: producers, window width, and the rate that sets entry depth.
+
+    ``producers`` mirrors the cache's naming contract — ``()`` for sliding (no compressor at
+    all), ``("compressor",)`` for HCA, ``("compressor", "indexer")`` for CSA. ``overlap`` is
+    true only for CSA, whose two-series windows carry a slice across the call boundary.
+    """
+
+    index: int
+    attention: str
+    mlp: str
+    producers: tuple[str, ...]
+    compress_rate: int | None
+    overlap: bool
+    sliding_window: int
+
+
+@dataclass(frozen=True)
 class V4ModelArgs:
     """Dimensions for one V4 build. Defaults are the frozen V4-Flash values."""
 
@@ -184,6 +202,31 @@ class V4ModelArgs:
         if self.schedule == "sliding_only":
             return [SLIDING] * n
         raise ValueError(f"unknown schedule {self.schedule!r}")
+
+    def cache_plan(self) -> list["LayerCachePlan"]:
+        """Per-layer allocation plan: what state each layer owns, before any device exists.
+
+        This is the seam the assembly and the capacity math both consume, so the released
+        schedule's *positions* (not just its counts) are stated once here. It matters now that
+        sliding layers exist at 0 and 1 (worklog 54d30a): a plan derived from the old default
+        rule would allocate compressor state for two layers that instead need a 128-token KV
+        window, and would be wrong in a way no single-layer test notices.
+        """
+        types, mlps = self.layer_types(), self.mlp_layer_types()
+        rates = self.compress_rates
+        plan = []
+        for i, kind in enumerate(types):
+            if kind == SLIDING:
+                plan.append(LayerCachePlan(i, kind, mlps[i], (), None, False, self.sliding_window))
+            elif kind == CSA:
+                plan.append(
+                    LayerCachePlan(i, kind, mlps[i], ("compressor", "indexer"), rates[kind], True, self.sliding_window)
+                )
+            elif kind == HCA:
+                plan.append(LayerCachePlan(i, kind, mlps[i], ("compressor",), rates[kind], False, self.sliding_window))
+            else:
+                raise ValueError(f"layer {i}: unknown attention class {kind!r}")
+        return plan
 
     def mlp_layer_types(self) -> list[str]:
         return [HASH_MOE] * min(self.num_hidden_layers, self.num_hash_layers) + [MOE] * max(
