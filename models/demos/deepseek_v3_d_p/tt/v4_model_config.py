@@ -57,6 +57,11 @@ MOE = "moe"
 HASH_MOE = "hash_moe"
 
 
+#: The checkpoint's per-layer `compress_ratios` values and their attention classes. This is
+#: the same mapping ``DeepseekV4Config._COMPRESS_RATIO_TO_LAYER_TYPE`` applies.
+COMPRESS_RATIO_TO_LAYER_TYPE = {0: SLIDING, 4: CSA, 128: HCA}
+
+
 def _interleave(n_layers: int, first_two_hca: bool = True) -> list[str]:
     """The config's own default rule, reproduced so a mismatch is loud.
 
@@ -94,6 +99,12 @@ class V4ModelArgs:
     index_head_dim: int = F.INDEX_HEAD_DIM
     index_topk: int = F.INDEX_TOPK
     compress_rates: dict = field(default_factory=lambda: dict(F.COMPRESS_RATES))
+    #: The per-layer schedule as the checkpoint carries it (0 sliding, 4 CSA, 128 HCA).
+    #: Empty means "let the config class apply its own default rule", which is the V4-Pro
+    #: shape and is NOT what V4-Flash ships.
+    compress_ratios: list = field(default_factory=lambda: list(F.COMPRESS_RATIOS))
+    #: YaRN block for the compress rope group, from the checkpoint's `rope_scaling`.
+    rope_scaling: dict = field(default_factory=lambda: dict(F.ROPE_SCALING))
 
     # mHC
     hc_mult: int = F.HC_MULT
@@ -161,7 +172,13 @@ class V4ModelArgs:
     def layer_types(self) -> list[str]:
         n = self.num_hidden_layers
         if self.schedule == "flash":
-            return _interleave(n)
+            if not self.compress_ratios:
+                return _interleave(n)
+            unknown = sorted(set(self.compress_ratios) - set(COMPRESS_RATIO_TO_LAYER_TYPE))
+            if unknown:
+                raise ValueError(f"unknown compress ratios {unknown}; known: 0, 4, 128")
+            # Truncation is contractual: the checkpoint ships 46 entries for 43 layers.
+            return [COMPRESS_RATIO_TO_LAYER_TYPE[r] for r in self.compress_ratios[:n]]
         if self.schedule == "hca_only":
             return [HCA] * n
         if self.schedule == "sliding_only":
@@ -188,17 +205,17 @@ class V4ModelArgs:
         ``torch.empty``; and it is what derives ``layer_types`` /
         ``mlp_layer_types`` when we do not pass them explicitly.
         """
-        from models.demos.deepseek_v3_d_p.reference.deepseek_v4.configuration_deepseek_v4 import (
-            DeepseekV4Config,
-        )
+        from models.demos.deepseek_v3_d_p.reference.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 
         kwargs = {
-            k: v
-            for k, v in self.__dict__.items()
-            if k not in {"schedule"} and not k.startswith("_") and v is not None
+            k: v for k, v in self.__dict__.items() if k not in {"schedule"} and not k.startswith("_") and v is not None
         }
         kwargs["intermediate_size"] = self.moe_intermediate_size * 2
-        kwargs["layer_types"] = self.layer_types()
+        if self.schedule != "flash":
+            # Substituted schedules are the port's own choice, so they must be stated
+            # explicitly; the released schedule comes from `compress_ratios` instead, so
+            # that the config class owns the mapping rather than duplicating it here.
+            kwargs["layer_types"] = self.layer_types()
         kwargs["mlp_layer_types"] = self.mlp_layer_types()
         kwargs["partial_rotary_factor"] = self.qk_rope_head_dim / self.head_dim
         return DeepseekV4Config(**kwargs)

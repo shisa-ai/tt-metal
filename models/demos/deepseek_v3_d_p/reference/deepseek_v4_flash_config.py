@@ -50,6 +50,26 @@ class DeepSeekV4FlashConfig:
     # Compressed attention config
     COMPRESS_RATES = {"compressed_sparse_attention": 4, "heavily_compressed_attention": 128}
     COMPRESS_ROPE_THETA = 160000.0
+    # Per-layer schedule, verbatim from the checkpoint's legacy `compress_ratios` key:
+    # 0 = sliding, 4 = CSA, 128 = HCA. This IS a checkpoint fact, and it is what makes
+    # V4-Flash differ from the config class's own V4-Pro default (2x HCA bootstrap, then
+    # HCA/CSA interleave, no sliding layers). `DeepseekV4Config` maps it through
+    # `_COMPRESS_RATIO_TO_LAYER_TYPE` and truncates to `num_hidden_layers`; the list is
+    # 46 entries long for a 43-layer model, so truncation is part of the contract.
+    # Written as the pattern it actually is: two sliding layers, then 20 (CSA, HCA)
+    # pairs, one trailing CSA, then the three MTP-ish zeros the checkpoint carries.
+    # Truncation to num_hidden_layers happens in the config class.
+    COMPRESS_RATIOS = [0, 0] + [4, 128] * 20 + [4] + [0] * 3
+    # YaRN block from the checkpoint's `rope_scaling`. It applies to the *compress*
+    # rope group only; `DeepseekV4Config.__post_init__` splits it and injects
+    # `attention_factor=1.0`, because the V4 reference does not apply YaRN's mscale.
+    ROPE_SCALING = {
+        "type": "yarn",
+        "factor": 16,
+        "original_max_position_embeddings": 65536,
+        "beta_fast": 32,
+        "beta_slow": 1,
+    }
     HC_MULT = 4
     HC_SINKHORN_ITERS = 20
     HC_EPS = 1.0e-6

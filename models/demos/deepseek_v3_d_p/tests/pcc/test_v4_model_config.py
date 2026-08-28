@@ -7,10 +7,13 @@ Everything in the TTNN glue is sized and scheduled from ``V4ModelArgs``, so a
 drift here silently changes which model we are building. These checks are cheap
 and need no device.
 
-The most important one is that our reproduction of the reference's default layer
-schedule agrees with the reference itself. If that ever disagrees, every parity
-number measured through the substituted schedule is describing a different
-architecture than the model.
+The most important ones are that our schedule and rope groups agree with what the
+released checkpoint tells the reference to build. If they ever disagree, every parity
+number measured through the preset is describing a different architecture than the
+model — which is exactly the bug found in worklog 974c2b: the preset reproduced
+``DeepseekV4Config``'s *default* rule (a V4-Pro shape: two HCA bootstrap layers, then
+HCA/CSA interleaved, **no sliding layers**) while V4-Flash ships a per-layer
+``compress_ratios`` list in ``config.json`` that yields ``S S C H C H …``.
 """
 
 from __future__ import annotations
@@ -18,36 +21,101 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 import torch
 
 from models.demos.deepseek_v3_d_p.reference.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
 from models.demos.deepseek_v3_d_p.tt.v4_model_config import CSA, HCA, SLIDING, V4ModelArgs
+from models.demos.deepseek_v3_d_p.tt.v4_weight_stream import default_snapshot_dir
 
 
-def test_our_schedule_matches_the_reference_default_rule():
-    """`flash` must reproduce what DeepseekV4Config derives on its own."""
+def _reference_from_checkpoint(n_layers: int | None = None) -> DeepseekV4Config:
+    """The reference config built the way the checkpoint says to build it."""
+    src = V4ModelArgs()
+    kwargs = dict(
+        vocab_size=64,
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=64,
+        num_hidden_layers=n_layers or src.num_hidden_layers,
+        num_attention_heads=2,
+        head_dim=32,
+        qk_rope_head_dim=8,
+        q_lora_rank=32,
+        o_lora_rank=32,
+        o_groups=2,
+        index_n_heads=2,
+        index_head_dim=16,
+        index_topk=8,
+        num_experts_per_tok=2,
+        n_routed_experts=4,
+        compress_ratios=src.compress_ratios,
+    )
+    return DeepseekV4Config(**kwargs)
+
+
+def test_our_schedule_matches_the_checkpoint_driven_reference():
+    """`flash` must reproduce what DeepseekV4Config derives from the checkpoint's ratios."""
     for n in (1, 2, 3, 4, 8, 43):
         ours = V4ModelArgs.tiny(n).layer_types()
-        theirs = DeepseekV4Config(
-            vocab_size=64,
-            hidden_size=64,
-            intermediate_size=128,
-            moe_intermediate_size=64,
-            num_hidden_layers=n,
-            num_attention_heads=2,
-            head_dim=32,
-            qk_rope_head_dim=8,
-            q_lora_rank=32,
-            o_lora_rank=32,
-            o_groups=2,
-            index_n_heads=2,
-            index_head_dim=16,
-            index_topk=8,
-            num_experts_per_tok=2,
-            n_routed_experts=4,
-        ).layer_types
+        theirs = _reference_from_checkpoint(n).layer_types
         assert ours == theirs, f"n={n}: ours={ours[:4]} reference={theirs[:4]}"
+
+
+def test_the_released_schedule_is_not_the_reference_default_rule():
+    """Names the trap: the config class's own fallback rule is a V4-Pro shape, not V4-Flash's.
+
+    `V4ModelArgs` only reproduces the released model because it carries `compress_ratios`.
+    With them emptied it degrades to the class default rule — which is *not* V4-Flash. If
+    the fallback ever stops matching the class default, the plumbing deserves a review.
+    """
+    default_rule = _reference_from_checkpoint(43)
+    default_rule.compress_ratios = None
+    default_rule.layer_types = None
+    default_rule.__post_init__()
+
+    released = V4ModelArgs.tiny(43).layer_types()
+    fallback = V4ModelArgs(**{**V4ModelArgs.tiny(43).__dict__, "compress_ratios": []}).layer_types()
+
+    assert fallback == default_rule.layer_types, "the no-ratios fallback no longer matches the class rule"
+    assert released != default_rule.layer_types, "released and default schedules must differ"
+    assert SLIDING in released, "the released schedule must contain sliding layers"
+    assert SLIDING not in default_rule.layer_types, "the default rule has no sliding layers (V4-Pro shape)"
+    assert default_rule.layer_types[:2] == [HCA, HCA], "the default rule leads with two HCA bootstrap layers"
+    assert released[:4] == [SLIDING, SLIDING, CSA, HCA], f"released schedule head changed: {released[:4]}"
+
+
+def test_preset_reproduces_the_released_checkpoint_config():
+    """The gate that would have caught worklog 974c2b: preset == what the weights demand.
+
+    Field-by-field against ``AutoConfig`` on the real snapshot, so a preset that quietly
+    matches *some* config rather than *this* one cannot pass.
+    """
+    snap = default_snapshot_dir()
+    if snap is None:
+        pytest.skip("no V4-Flash snapshot available; DS4_V4_FLASH_DIR unset and hub cache empty")
+    from transformers import AutoConfig
+
+    released = AutoConfig.from_pretrained(snap, trust_remote_code=True)
+    ours = V4ModelArgs().drive_reference()
+
+    assert list(ours.layer_types) == list(released.layer_types), "layer schedule differs"
+    assert ours.compress_rates == released.compress_rates, "compress rates differ"
+    assert ours.num_hidden_layers == released.num_hidden_layers
+    assert ours.hidden_size == released.hidden_size
+    assert ours.head_dim == released.head_dim
+    assert ours.index_topk == released.index_topk
+    assert ours.index_n_heads == released.index_n_heads
+    assert ours.index_head_dim == released.index_head_dim
+    assert ours.rope_theta == released.rope_theta
+    for group in ("main", "compress"):
+        assert (
+            ours.rope_parameters[group] == released.rope_parameters[group]
+        ), f"rope group {group}: ours={ours.rope_parameters[group]} released={released.rope_parameters[group]}"
+    # Both rope facts that the checkpoint carries and that a preset can silently drop.
+    assert ours.rope_parameters["compress"]["rope_type"] == "yarn", "compress rope lost YaRN"
+    assert ours.rope_parameters["main"]["rope_type"] == "default", "main rope must stay plain"
 
 
 def test_substituted_schedules_clear_the_only_blocked_op():
