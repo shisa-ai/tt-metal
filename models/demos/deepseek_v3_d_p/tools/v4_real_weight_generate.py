@@ -142,6 +142,13 @@ def main() -> int:
         'subscriptable", so sharing a process would contaminate the control.',
     )
     ap.add_argument("--layers", type=int, default=None, help="truncate the stack (smoke only)")
+    ap.add_argument(
+        "--no-compressors",
+        action="store_true",
+        help="force every layer to sliding attention, keeping the released weights and MoE "
+        "schedule. Isolates whether the HCA/CSA path is necessary for cached-incremental and "
+        "cached one-shot to disagree (see worklog e3838b).",
+    )
     ap.add_argument("--expect-first-token", type=int, default=None, help="guard: prefill argmax must equal this")
     ap.add_argument(
         "--per-prefix-golden",
@@ -197,6 +204,15 @@ def main() -> int:
         # schedules per layer, so lowering the count is enough. compress_ratios is not even
         # kept as an attribute on the driven config -- it is consumed to derive layer_types.
         cfg.num_hidden_layers = args.layers
+    if args.no_compressors:
+        # Compressor-off control: identical weights, identical MoE schedule (layers 0-2 are
+        # hash_moe either way), every layer becomes a plain sliding-window layer. The only thing
+        # removed versus the default run is the HCA/CSA path -- which is what the isolation
+        # ladder blames for cached-incremental diverging from cached one-shot. cfg.compress_ratios
+        # is consumed to derive layer_types and is not kept on the config, so layer_types is the
+        # attribute that has to be overridden.
+        cfg.layer_types = ["sliding_attention"] * cfg.num_hidden_layers
+    print(f"layer_types[:{cfg.num_hidden_layers}] = {list(cfg.layer_types)[: cfg.num_hidden_layers]}", flush=True)
     dtype = getattr(torch, args.dtype)
 
     t0 = time.time()
