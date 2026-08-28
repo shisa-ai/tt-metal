@@ -141,6 +141,14 @@ def main() -> int:
     )
     ap.add_argument("--layers", type=int, default=None, help="truncate the stack (smoke only)")
     ap.add_argument("--expect-first-token", type=int, default=None, help="guard: prefill argmax must equal this")
+    ap.add_argument(
+        "--per-prefix-golden",
+        type=int,
+        default=0,
+        help="greedy decode where EVERY step is one cache-free forward over the actual prefix. "
+        "Definitionally chunk-independent, so it is the only completion here that can serve as "
+        "a parity target without first deciding which cache path is canonical.",
+    )
     ap.add_argument("--out", default=None)
     ap.add_argument(
         "--teacher-forcing-check",
@@ -242,6 +250,62 @@ def main() -> int:
     ids = tok(args.prompt, return_tensors="pt", truncation=True, max_length=512)["input_ids"]
     prompt_tokens = int(ids.shape[1])
     print(f"prompt: {prompt_tokens} tokens {args.prompt!r}", flush=True)
+
+    if args.per_prefix_golden:
+        # Each step re-runs the whole prefix with no cache. That is quadratic and slow, and it
+        # is the point: the value at position len(seq)-1 comes from one forward over exactly the
+        # tokens that precede it, so nothing about call boundaries, compressor windows, or the
+        # sliding cache can influence it. Compare against the cached decode afterwards.
+        seq = ids[0].tolist()
+        prefix_rows = []
+        for step in range(args.per_prefix_golden):
+            t_step = time.time()
+            with torch.no_grad():
+                lg = model(input_ids=torch.tensor([seq]), use_cache=False).logits[0, -1].float()
+            top = torch.topk(lg, 5)
+            nxt = int(top.indices[0])
+            prefix_rows.append(
+                {
+                    "step": step,
+                    "prefix_len": len(seq),
+                    "argmax": nxt,
+                    "text": tok.decode([nxt]),
+                    "margin_top2": round(float(top.values[0] - top.values[1]), 4),
+                    "top5": [
+                        {"id": int(i), "text": tok.decode([int(i)]), "logit": round(float(v), 4)}
+                        for i, v in zip(top.indices.tolist(), top.values.tolist())
+                    ],
+                    "logits_finite": bool(torch.isfinite(lg).all()),
+                    "forward_s": round(time.time() - t_step, 1),
+                    "bytes_read_gib": round(ck.bytes_read / 2**30, 2),
+                }
+            )
+            print(
+                f"  prefix[{len(seq):2d}] -> {nxt:6d} {tok.decode([nxt])!r:12s} "
+                f"margin={prefix_rows[-1]['margin_top2']:.3f} finite={prefix_rows[-1]['logits_finite']} "
+                f"({prefix_rows[-1]['forward_s']} s, {prefix_rows[-1]['bytes_read_gib']} GiB)",
+                flush=True,
+            )
+            seq.append(nxt)
+            if args.out:
+                json.dump(
+                    {
+                        "mode": "per_prefix_greedy_cache_free",
+                        "layers": cfg.num_hidden_layers,
+                        "dtype": args.dtype,
+                        "prompt": args.prompt,
+                        "prompt_tokens": prompt_tokens,
+                        "rows": prefix_rows,
+                        "greedy_text": args.prompt + "".join(r["text"] for r in prefix_rows),
+                    },
+                    open(args.out + ".partial", "w"),
+                    indent=1,
+                )
+        if args.out:
+            os.replace(args.out + ".partial", args.out)
+            print("wrote", args.out, flush=True)
+        print("per-prefix greedy:", repr(args.prompt + "".join(r["text"] for r in prefix_rows))[-200:], flush=True)
+        return 0
 
     generated, guard = [], {"expected": args.expect_first_token, "passed": None}
     result = {
