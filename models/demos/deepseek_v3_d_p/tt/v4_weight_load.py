@@ -290,23 +290,36 @@ def iter_reference_layer(
 MODEL_LEVEL = ("embed.weight", "norm.weight", "head.weight", "hc_head_base", "hc_head_fn", "hc_head_scale")
 
 
-def set_param(model: torch.nn.Module, dotted: str, tensor: torch.Tensor) -> None:
+def set_param(model: torch.nn.Module, dotted: str, tensor: torch.Tensor, *, skip_missing: bool = False) -> bool:
     """Replace one meta parameter with the loaded one.
 
     Assigning ``param.data`` is refused across the meta boundary ("incompatible tensor type"),
     so the parameter object is swapped instead. Shapes are checked first: a wrong shape here
     would otherwise broadcast a weight into the module and train/serve a quietly transposed
     projection.
+
+    Returns True when the parameter was installed, False when it was deliberately skipped.
+    ``skip_missing`` (default False, i.e. today's strict behaviour) tolerates a name whose parent
+    module does not exist. That is what the compressor-off control needs: forcing every layer to
+    sliding attention leaves the checkpoint's ``attn.compressor.*`` names with nowhere to go, and
+    skipping them is the same established idea as ``dense layers have no routed experts``. A miss
+    is never silent -- the caller collects and reports them.
     """
     parent, _, attr = dotted.rpartition(".")
-    module = model.get_submodule(parent) if parent else model
-    current = getattr(module, attr)
+    try:
+        module = model.get_submodule(parent) if parent else model
+        current = getattr(module, attr)
+    except AttributeError:
+        if skip_missing:
+            return False
+        raise
     if tuple(current.shape) != tuple(tensor.shape):
         raise ValueError(
             f"{dotted}: model wants {tuple(current.shape)}, checkpoint gives {tuple(tensor.shape)} "
             f"(dtype {tensor.dtype}, requires_grad={current.requires_grad})"
         )
     setattr(module, attr, torch.nn.Parameter(tensor, requires_grad=False))
+    return True
 
 
 def free_module_params(module: torch.nn.Module) -> None:

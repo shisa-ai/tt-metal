@@ -61,14 +61,25 @@ def rss_gib() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
 
 
-def install_layer(ckpt: V4Checkpoint, layer, index: int, dtype, stats: list, lazy: bool = True) -> int:
-    """Load one layer's non-expert weights and stand in lazy stacks for its experts."""
+SKIPPED: list[str] = []
+
+
+def install_layer(
+    ckpt: V4Checkpoint, layer, index: int, dtype, stats: list, lazy: bool = True, skip_missing: bool = False
+) -> int:
+    """Load one layer's non-expert weights and stand in lazy stacks for its experts.
+
+    ``skip_missing`` is for the compressor-off control, where the built model has no compressor
+    modules for the checkpoint's compressor names to land in; skipped names are collected in
+    ``SKIPPED`` so the run reports what it did not load.
+    """
     t0 = time.time()
     experts = 0
     # skip_experts keeps the routed experts in the file: a lazy stack reads them per hit, and
     # building 256-expert stacks here would dequantize ~24 GiB per layer to throw it away.
     for ref, tensor in iter_reference_layer(ckpt, index, dtype=dtype, skip_experts=lazy):
-        set_param(layer, ref, tensor)
+        if not set_param(layer, ref, tensor, skip_missing=skip_missing):
+            SKIPPED.append(f"layer{index}:{ref}")
         del tensor
     if not lazy:
         return 0
@@ -233,11 +244,17 @@ def main() -> int:
     model.set_experts_implementation(args.experts_implementation)
     lazy = args.experts_implementation == "eager"
     for i, layer in enumerate(model.model.layers):
-        stacks += install_layer(ck, layer, i, dtype, stats, lazy=lazy)
+        stacks += install_layer(ck, layer, i, dtype, stats, lazy=lazy, skip_missing=args.no_compressors)
     print(
         f"model resident: {stacks} expert stacks lazy, RSS {rss_gib():.1f} GiB, " f"{time.time() - t0:.0f} s elapsed",
         flush=True,
     )
+    if SKIPPED:
+        print(
+            f"skipped {len(SKIPPED)} checkpoint names with no module in the built model "
+            f"(compressor-off control; e.g. {SKIPPED[0]})",
+            flush=True,
+        )
 
     tok = AutoTokenizer.from_pretrained(snap, trust_remote_code=True)
     if args.teacher_force_ids:
