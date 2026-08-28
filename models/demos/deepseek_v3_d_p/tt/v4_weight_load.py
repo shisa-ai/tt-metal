@@ -236,6 +236,7 @@ def iter_reference_layer(
     layer: int,
     *,
     dtype: torch.dtype = torch.bfloat16,
+    skip_experts: bool = False,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield one layer's parameters under the reference model's names.
 
@@ -243,6 +244,12 @@ def iter_reference_layer(
     buffers; nothing accumulates across layers, because the whole model in bfloat16 is ~559
     GiB and does not fit in host RAM. Callers must consume each tensor before asking for the
     next layer (that is what makes this a stream rather than a slower way to run out of memory).
+
+    ``skip_experts`` leaves the routed experts in the checkpoint entirely: nothing is read for
+    them and no stack is yielded. Callers that answer ``gate_up_proj[e]`` on demand
+    (:class:`LazyExpertStack`) must set it -- without it, installing a 43-layer model would
+    dequantize all 1032 GiB of experts (256 per layer at 96 MiB each in fp32) to build stacks
+    that are thrown away unread.
     """
     experts: dict[int, dict[str, torch.Tensor]] = {}
     for name in ckpt.layer_names(layer):
@@ -251,10 +258,14 @@ def iter_reference_layer(
             continue
         m = EXPERT_RE.match(suffix)
         if m:
+            if skip_experts:
+                continue
             experts.setdefault(int(m.group(1)), {})[m.group(2)] = ckpt.dequantized(name, dtype)
             continue
         yield reference_name(name), ckpt.dequantized(name, dtype)
 
+    if skip_experts:
+        return
     if experts:
         n = max(experts) + 1
         have = sorted(experts)
@@ -274,6 +285,60 @@ def iter_reference_layer(
             del parts
         yield "mlp.experts.gate_up_proj", gate_up
         yield "mlp.experts.down_proj", down
+
+
+MODEL_LEVEL = ("embed.weight", "norm.weight", "head.weight", "hc_head_base", "hc_head_fn", "hc_head_scale")
+
+
+def set_param(model: torch.nn.Module, dotted: str, tensor: torch.Tensor) -> None:
+    """Replace one meta parameter with the loaded one.
+
+    Assigning ``param.data`` is refused across the meta boundary ("incompatible tensor type"),
+    so the parameter object is swapped instead. Shapes are checked first: a wrong shape here
+    would otherwise broadcast a weight into the module and train/serve a quietly transposed
+    projection.
+    """
+    parent, _, attr = dotted.rpartition(".")
+    module = model.get_submodule(parent) if parent else model
+    current = getattr(module, attr)
+    if tuple(current.shape) != tuple(tensor.shape):
+        raise ValueError(
+            f"{dotted}: model wants {tuple(current.shape)}, checkpoint gives {tuple(tensor.shape)} "
+            f"(dtype {tensor.dtype}, requires_grad={current.requires_grad})"
+        )
+    setattr(module, attr, torch.nn.Parameter(tensor, requires_grad=False))
+
+
+def free_module_params(module: torch.nn.Module) -> None:
+    """Drop a finished layer's weights. Peak memory is bounded by one layer, not the stack."""
+    for name, p in list(module.named_parameters()):
+        parent, _, attr = name.rpartition(".")
+        holder = module.get_submodule(parent) if parent else module
+        setattr(
+            holder,
+            attr,
+            torch.nn.Parameter(torch.empty(tuple(p.shape), dtype=p.dtype, device="meta"), requires_grad=False),
+        )
+
+
+def build(cfg, dtype: torch.dtype):
+    """Model at real geometry with parameters on meta and *buffers* computed for real.
+
+    ``include_buffers=False`` matters: the RoPE inverse-frequency tables are derived in
+    ``__init__`` and would otherwise land on meta, and they are not in the checkpoint.
+
+    Imported here rather than at module scope so that reading weights does not require
+    building a reference model, and so this module stays importable without accelerate.
+    """
+    from accelerate import init_empty_weights
+
+    from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+
+    with init_empty_weights(include_buffers=False):
+        model = DeepseekV4ForCausalLM(cfg)
+    model.to(dtype)
+    model.eval()
+    return model
 
 
 class LazyExpertStack:
@@ -332,7 +397,11 @@ class LazyExpertStack:
 
 
 __all__ = [
+    "MODEL_LEVEL",
     "LazyExpertStack",
+    "build",
+    "free_module_params",
+    "set_param",
     "LAYER_ALIASES",
     "MODEL_ALIASES",
     "DERIVED_REFERENCE_NAMES",
