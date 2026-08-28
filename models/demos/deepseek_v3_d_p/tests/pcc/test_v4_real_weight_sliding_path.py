@@ -147,3 +147,49 @@ def test_window_mask_at_the_real_128_boundary(released, port_module):
     # dtype minimum, which is what lets the same tensor be added to attention scores.
     assert mask[0, 0, 128, 128] == 0.0
     assert mask[0, 0, 128, 0] < -1e30
+
+
+def test_preset_rope_groups_are_bit_identical_to_the_checkpoint_config(released):
+    """The preset must reproduce BOTH rope groups exactly, not just the sliding one.
+
+    The compress group is YaRN (factor 16, theta 160000, original_max_position_embeddings
+    65536) and the main group is plain (theta 10000). Getting only the thetas across, as an
+    earlier preset did, yields an unscaled compress rope — which no oracle test can see,
+    because the oracle builds both sides from the same preset. So this compares the preset's
+    driven config against the config the checkpoint demands, and then the tables those
+    configs make, position by position. Equality is demanded exactly: a correctly wired YaRN
+    block reproduces the reference tables bit for bit, and anything else is a bug to find.
+    """
+    from accelerate import init_empty_weights
+
+    from models.demos.deepseek_v3_d_p.reference.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+
+    rel_cfg, _ = released
+    pre_cfg = V4ModelArgs().drive_reference()
+
+    # Only the two named groups are compared. Building any HF model also writes flat legacy
+    # keys (rope_type/rope_theta/partial_rotary_factor) into config.rope_parameters, so the
+    # dict's key set depends on whether a model has been constructed from the config yet --
+    # measured, not assumed: comparing keys fails only after the fixture has built one.
+    rel_rope, pre_rope = dict(rel_cfg.rope_parameters), dict(pre_cfg.rope_parameters)
+    for group in ("main", "compress"):
+        assert group in rel_rope and group in pre_rope, f"missing rope group {group}"
+        assert (
+            rel_rope[group] == pre_rope[group]
+        ), f"{group} rope block differs:\n  released {rel_rope[group]}\n  preset   {pre_rope[group]}"
+    assert pre_rope["compress"]["rope_type"] == "yarn" and pre_rope["compress"]["factor"] == 16
+
+    positions = torch.arange(2048).unsqueeze(0)
+    probe = torch.zeros(1, 2048, dtype=torch.float32)
+    for group in ("main", "compress"):
+        tables = []
+        for cfg in (rel_cfg, pre_cfg):
+            with init_empty_weights(include_buffers=False):
+                model = DeepseekV4ForCausalLM(cfg)
+            cos, sin = model.model.rotary_emb(probe, position_ids=positions, layer_type=group)
+            tables.append((cos.reshape(2048, -1).float(), sin.reshape(2048, -1).float()))
+        (rc, rs), (pc, ps) = tables
+        assert pc.shape == rc.shape, f"{group}: {pc.shape} vs {rc.shape}"
+        dc = float((pc - rc).abs().max())
+        ds = float((ps - rs).abs().max())
+        assert dc == 0.0 and ds == 0.0, f"{group} rope tables differ: cos {dc:.3e}, sin {ds:.3e}"
