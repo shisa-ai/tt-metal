@@ -86,6 +86,23 @@ def test_the_released_schedule_is_not_the_reference_default_rule():
     assert released[:4] == [SLIDING, SLIDING, CSA, HCA], f"released schedule head changed: {released[:4]}"
 
 
+def test_non_released_schedules_drive_a_matching_reference_config():
+    """`layer_types()` and the config it drives must never disagree.
+
+    A preset whose *own* schedule list differs from what the config class derives makes two
+    halves of the port disagree — and `DeepseekV4Config` rejects the length mismatch
+    outright, which is how this defect was first noticed.
+    """
+    cases = {
+        "empty ratios (class fallback rule)": V4ModelArgs(**{**V4ModelArgs.tiny(4).__dict__, "compress_ratios": []}),
+        "hca_only": V4ModelArgs(**{**V4ModelArgs.tiny(4).__dict__, "schedule": "hca_only"}),
+        "sliding_only": V4ModelArgs(**{**V4ModelArgs.tiny(4).__dict__, "schedule": "sliding_only"}),
+    }
+    for name, args in cases.items():
+        driven = list(args.drive_reference().layer_types)
+        assert driven == args.layer_types(), f"{name}: driven {driven} != layer_types() {args.layer_types()}"
+
+
 def test_preset_reproduces_the_released_checkpoint_config():
     """The gate that would have caught worklog 974c2b: preset == what the weights demand.
 

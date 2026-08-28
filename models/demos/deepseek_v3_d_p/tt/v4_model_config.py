@@ -211,10 +211,16 @@ class V4ModelArgs:
             k: v for k, v in self.__dict__.items() if k not in {"schedule"} and not k.startswith("_") and v is not None
         }
         kwargs["intermediate_size"] = self.moe_intermediate_size * 2
-        if self.schedule != "flash":
-            # Substituted schedules are the port's own choice, so they must be stated
-            # explicitly; the released schedule comes from `compress_ratios` instead, so
-            # that the config class owns the mapping rather than duplicating it here.
+        if self.compress_ratios and self.schedule == "flash":
+            # The released schedule comes from `compress_ratios`, so the config class owns
+            # the ratio->type mapping rather than us duplicating it here.
+            kwargs["compress_ratios"] = list(self.compress_ratios)
+        else:
+            # Substituted schedules are the port's own choice, and an emptied ratio list
+            # means "use the class fallback rule"; both have to be stated as explicit
+            # `layer_types`, because the class would otherwise derive a schedule that does
+            # not match `layer_types()` (and reject the length mismatch outright).
+            kwargs.pop("compress_ratios", None)
             kwargs["layer_types"] = self.layer_types()
         kwargs["mlp_layer_types"] = self.mlp_layer_types()
         kwargs["partial_rotary_factor"] = self.qk_rope_head_dim / self.head_dim
