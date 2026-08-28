@@ -146,8 +146,11 @@ def main() -> int:
         type=int,
         default=0,
         help="greedy decode where EVERY step is one cache-free forward over the actual prefix. "
-        "Definitionally chunk-independent, so it is the only completion here that can serve as "
-        "a parity target without first deciding which cache path is canonical.",
+        "Deterministic and independent of call boundaries, but NOT equivalent to cached decode: "
+        "the cache-free branch of the CSA/HCA compressors drops the tokens past the last whole "
+        "compression window, so every step after an aligned prefix silently ignores the newest "
+        "1-3 tokens (see tests/pcc/test_v4_compress_window_truncation.py). Kept as the control "
+        "that measures that gap, not as a golden.",
     )
     ap.add_argument("--out", default=None)
     ap.add_argument(
@@ -252,10 +255,16 @@ def main() -> int:
     print(f"prompt: {prompt_tokens} tokens {args.prompt!r}", flush=True)
 
     if args.per_prefix_golden:
-        # Each step re-runs the whole prefix with no cache. That is quadratic and slow, and it
-        # is the point: the value at position len(seq)-1 comes from one forward over exactly the
-        # tokens that precede it, so nothing about call boundaries, compressor windows, or the
-        # sliding cache can influence it. Compare against the cached decode afterwards.
+        # Each step re-runs the whole prefix with no cache. Quadratic and slow, on purpose: the
+        # value at position len(seq)-1 comes from one forward over exactly the tokens that
+        # precede it, so no call boundary or cache state can influence it.
+        #
+        # It is NOT the canonical greedy. `cache_layer is None` in both compressors keeps only
+        # `(L // rate) * rate` tokens, so for a 13-token prefix at rate 4 the newest token is
+        # projected and then discarded. That makes this the right instrument to *measure* the
+        # cache-free/cache gap with, and the wrong one to serve as a parity target: the cached
+        # path is what a serving stack actually computes, and it is chunk-size invariant
+        # (asserted in tests/pcc/test_v4_compress_window_truncation.py).
         seq = ids[0].tolist()
         prefix_rows = []
         for step in range(args.per_prefix_golden):
