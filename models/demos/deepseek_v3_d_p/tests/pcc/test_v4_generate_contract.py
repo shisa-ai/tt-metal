@@ -6,9 +6,11 @@
 This is the property our decode loop must satisfy for "inference" to mean anything:
 **greedy single-token generation must equal teacher-forced prefill at every step.**
 Per-module contracts exist for attention (cc48c4) and compression (f6d531); this is the
-whole-model version, over the real substituted tiny schedule — HCA x3 + CSA with
-`hash_moe` on layer 0 and top-k `moe` elsewhere, so hash routing, learned routing,
-partial compression and mHC all sit inside the loop being checked.
+whole-model version, over the tiny preset's tiny slice of the released schedule —
+sliding, sliding, CSA, HCA (worklog 974c2b; the preset used to emit the config class's
+V4-Pro default of HCA x3 + CSA) with `hash_moe` on layer 0 and top-k `moe` elsewhere, so
+sliding attention, hash routing, learned routing, partial compression and mHC all sit
+inside the loop being checked.
 
 Why teacher-forcing is the right oracle: it needs no cache at all. Any disagreement
 between stepping and full prefill is therefore attributable to state carried across calls
@@ -129,9 +131,7 @@ def test_golden_sequence_is_reproducible_from_the_weight_fingerprint(args):
             assert fingerprint, "oracle must report a weight fingerprint"
         else:
             assert fingerprint == first_fingerprint, "same seed must reproduce the fingerprint"
-            assert tokens == prompt_tokens, (
-                f"same fingerprint produced different tokens: {tokens} vs {prompt_tokens}"
-            )
+            assert tokens == prompt_tokens, f"same fingerprint produced different tokens: {tokens} vs {prompt_tokens}"
 
 
 def test_decode_loop_survives_a_longer_prompt(args):
@@ -153,3 +153,61 @@ def test_decode_loop_survives_a_longer_prompt(args):
         assert int(tf.argmax()) == tokens[k], f"long-prompt step {k}: argmax diverged"
         err = float((tf - step).abs().max())
         assert err / float(tf.abs().max()) < 1e-5, f"long-prompt step {k}: logits diverged ({err:.3e})"
+
+
+# ---- pinned golden ---------------------------------------------------------- #
+
+# The tests above are self-consistency checks: two runs agree. Self-consistency cannot
+# catch an architecture change, because both runs move together — which is precisely how
+# the preset shipped a V4-Pro schedule and an unscaled compress rope (worklog 974c2b)
+# while every oracle test stayed green. These literals are the fixed expectation a
+# device-vs-oracle parity run compares against, and they are deliberately *over*
+# specific: the architecture digest is part of the golden, so a schedule or rope change
+# fails this test instead of quietly retargeting it.
+#
+# Deliberately NOT pinned: a digest of the step logits themselves. Measured on this host,
+# the first-step logits hash changes between OMP_NUM_THREADS=1 and the default thread
+# count (fp32 reduction order), while the greedy tokens do not change. Anything tighter
+# than argmax over fp32 host math is not reproducible — and that ~1e-6 relative wobble is
+# the noise floor any device PCC target has to sit above, so it is recorded here.
+GOLDEN = {
+    "weight_fingerprint": "1056550cba6c2c0b7c36b454796f9d449ad185c95a4ffea241e04d3b3e582ec4",
+    "architecture_digest": "792d7a9a1832cc45",
+    "tokens": [333, 432, 432, 496, 414, 63],
+}
+
+
+def _architecture_digest(cfg) -> str:
+    """What the golden is a property of: schedule, rope groups, compression, geometry."""
+    import hashlib
+    import json
+
+    src = {
+        "layer_types": list(cfg.layer_types),
+        "mlp_layer_types": list(cfg.mlp_layer_types),
+        "compress_rates": cfg.compress_rates,
+        "rope_parameters": cfg.rope_parameters,
+        "num_hidden_layers": cfg.num_hidden_layers,
+        "index_topk": cfg.index_topk,
+        "sliding_window": cfg.sliding_window,
+    }
+    return hashlib.sha256(json.dumps(src, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def test_pinned_golden_sequence_and_architecture(args):
+    """Greedy tokens, the weight fingerprint, and the architecture that produced them."""
+    model, fingerprint = build_reference_oracle(args, seed=0)
+    cfg = model.config
+    prompt = torch.randint(0, cfg.vocab_size, (1, PROMPT_LEN), generator=torch.Generator().manual_seed(11))
+    tokens, _ = greedy(model, cfg, prompt, STEPS)
+
+    assert (
+        fingerprint == GOLDEN["weight_fingerprint"]
+    ), f"oracle weights changed: {fingerprint} != {GOLDEN['weight_fingerprint']}"
+    digest = _architecture_digest(cfg)
+    assert digest == GOLDEN["architecture_digest"], (
+        f"architecture digest changed ({digest} != {GOLDEN['architecture_digest']}): the "
+        "schedule/rope/compression contract moved, so this golden no longer describes the "
+        "model — re-derive it deliberately, in its own commit, not as a side effect"
+    )
+    assert tokens == GOLDEN["tokens"], f"greedy tokens diverged from the pinned golden: {tokens}"
