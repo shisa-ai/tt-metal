@@ -15,6 +15,8 @@ architecture than the model.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -110,3 +112,57 @@ def test_unknown_schedule_is_rejected_not_silently_defaulted():
     args = V4ModelArgs(**{**V4ModelArgs.tiny(2).__dict__, "schedule": "sliding"})
     with pytest.raises(ValueError, match="sliding"):
         args.layer_types()
+
+
+# ---- mapping onto upstream's MoE gate -------------------------------------- #
+
+GATE_SOURCE = (
+    "models/demos/deepseek_v3_d_p/tt/moe/tt_moe_gate_prefill.py"
+)
+
+
+def test_gate_cfg_covers_every_key_the_gate_actually_reads():
+    """Derived from the gate source, not from a list we maintain by hand.
+
+    If upstream starts reading another ``model_cfg.X``, this fails rather than
+    letting the MoE silently fall back to a DeepSeek-V3 default at graph-build
+    time -- which is the kind of failure that only shows up on hardware.
+    """
+    import re
+    from pathlib import Path
+
+    text = Path(GATE_SOURCE).read_text()
+    reads = set(re.findall(r"model_cfg\.([A-Z][A-Z0-9_]*)", text))
+    assert reads, "no model_cfg reads found -- did the gate's config style change?"
+    missing = reads - set(V4ModelArgs().moe_gate_cfg())
+    assert not missing, f"gate reads keys we do not supply: {sorted(missing)}"
+
+
+def test_gate_cfg_disables_group_routing_because_v4_has_no_group_stage():
+    """n_expert_groups == 1 is the gate's ungrouped branch; V3 defaults would
+    enable grouped routing that the V4 reference never performs."""
+    cfg = V4ModelArgs().moe_gate_cfg()
+    assert cfg["NUM_EXPERT_GROUPS"] == 1
+    assert cfg["NUM_LIMITED_GROUPS"] == 1
+
+
+def test_gate_cfg_carries_v4_router_semantics():
+    cfg = V4ModelArgs().moe_gate_cfg()
+    assert cfg["SCORE_FUNC"] == "sqrtsoftplus", "V4 scores with sqrt(softplus(x)), not sigmoid/softmax"
+    assert cfg["ROUTE_SCALE"] == 1.5
+    assert cfg["NUM_ROUTED_EXPERTS"] == 256
+    # 6, not the 8 that DeepSeek-V3-family models use -- taken from the frozen
+    # inventory and pinned by test_real_flash_dims_are_frozen_not_editable.
+    assert cfg["NUM_EXPERTS_PER_TOKEN"] == 6
+    assert cfg["NUM_SHARED_EXPERTS"] == 1
+    assert cfg["EMB_SIZE"] == 4096
+
+
+def test_gate_cfg_tracks_config_instead_of_hardcoding():
+    args = replace(V4ModelArgs(), num_experts_per_tok=4, n_routed_experts=64, route_scale=2.0)
+    cfg = args.moe_gate_cfg()
+    assert cfg["NUM_EXPERTS_PER_TOKEN"] == 4
+    assert cfg["NUM_ROUTED_EXPERTS"] == 64
+    assert cfg["ROUTE_SCALE"] == 2.0
+    # ...but the group fields stay pinned regardless of model size.
+    assert cfg["NUM_EXPERT_GROUPS"] == cfg["NUM_LIMITED_GROUPS"] == 1

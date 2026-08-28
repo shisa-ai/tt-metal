@@ -206,6 +206,48 @@ class V4ModelArgs:
     def with_layers(self, n: int) -> "V4ModelArgs":
         return replace(self, num_hidden_layers=n)
 
+    # ---- mapping onto upstream's MoE gate --------------------------------- #
+
+    def moe_gate_cfg(self) -> dict:
+        """Keys ``TtMoEGatePrefill`` reads off a model config, filled for V4-Flash.
+
+        Upstream's MoE gate already covers the V4 router, so the MoE half is a
+        wiring job rather than a rewrite -- verified against the implementation,
+        not inferred from its name:
+
+        * ``tt_moe_gate_prefill.py:151`` -- "V4 variants ship
+          SCORE_FUNC=\"sqrtsoftplus\"; V3/Kimi omit it and keep the sigmoid
+          default", read via ``getattr(model_cfg, "SCORE_FUNC", cls.score_func)``.
+        * ``topk_method="noaux_tc"`` selects on ``scores + e_score_correction_bias``
+          and takes weights from the **un-biased** scores, then normalises and
+          scales -- which is what ``DeepseekV4TopKRouter`` does.
+        * hash routing is a first-class mode: ``RoutingType.HASH_HOST`` ("Host-first
+          implementation reusing the V4 reference HashRouter") and
+          ``HASH_DEVICE`` ("matmul device, moe_hash_gate device").
+
+        The one mapping that needs care is group routing. V4's reference router has
+        **no** expert-group stage (no ``group_score``/``topk_group`` semantics at
+        all), whereas the gate branches on ``n_expert_groups``: ``== 1`` is the
+        ungrouped path (commented "e.g. Kimi"), anything else takes grouped
+        routing. So both group fields must be 1 to reproduce V4 numerics; leaving
+        DeepSeek-V3 defaults in place would silently enable routing V4 does not do.
+
+        Not verified here and to be checked at parity: the gate's normalisation
+        epsilon versus the reference's literal ``1e-20``, and whether normalisation
+        happens before or after the gather. Either difference is small but real.
+        """
+        return {
+            "EMB_SIZE": self.hidden_size,
+            "NUM_ROUTED_EXPERTS": self.n_routed_experts,
+            "NUM_SHARED_EXPERTS": self.n_shared_experts,
+            "NUM_EXPERTS_PER_TOKEN": self.num_experts_per_tok,
+            # 1 disables the grouped-routing branch; V4 has no group stage at all.
+            "NUM_EXPERT_GROUPS": 1,
+            "NUM_LIMITED_GROUPS": 1,
+            "ROUTE_SCALE": self.route_scale,
+            "SCORE_FUNC": self.score_func,
+        }
+
     def describe(self) -> str:
         types = self.layer_types()
         mlps = self.mlp_layer_types()
