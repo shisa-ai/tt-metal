@@ -350,10 +350,13 @@ def test_full_model(mesh_device, reset_seeds, request):
     hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     hf_model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    log_layer_pcc = os.getenv("GEMMA4_LOG_LAYER_PCC") == "1"
+    component_layers = {int(value) for value in os.getenv("GEMMA4_COMPONENT_LAYERS", "").split(",") if value.strip()}
+    log_layer_pcc = os.getenv("GEMMA4_LOG_LAYER_PCC") == "1" or bool(component_layers)
     hf_layer_outputs = {}
     hf_layer_inputs = {}
     hf_pli_inputs = {}
+    hf_component_inputs = {}
+    hf_component_outputs = {}
     hf_final_norm_output = {}
     hf_layer_hooks = []
     if log_layer_pcc:
@@ -370,16 +373,73 @@ def test_full_model(mesh_device, reset_seeds, request):
 
         for layer_idx, layer in enumerate(hf_text_model.layers):
             hf_layer_hooks.append(layer.register_forward_hook(_capture_hf_layer(layer_idx)))
+            if layer_idx in component_layers:
+
+                def _capture_hf_component(component_layer_idx, component_name):
+                    def _hook(_module, inputs, output):
+                        if not inputs:
+                            return
+                        component_output = output[0] if isinstance(output, tuple) else output
+                        hf_component_inputs[(component_layer_idx, component_name)] = inputs[0].detach().cpu()
+                        hf_component_outputs[(component_layer_idx, component_name)] = component_output.detach().cpu()
+
+                    return _hook
+
+                for component_name in (
+                    "input_layernorm",
+                    "self_attn",
+                    "post_attention_layernorm",
+                    "pre_feedforward_layernorm",
+                    "mlp",
+                    "post_feedforward_layernorm",
+                    "per_layer_input_gate",
+                    "per_layer_projection",
+                    "post_per_layer_input_norm",
+                ):
+                    component = getattr(layer, component_name, None)
+                    if component is not None:
+                        if component_name == "self_attn":
+
+                            def _capture_hf_attention(component_layer_idx):
+                                def _hook(_module, _inputs, kwargs, output):
+                                    component_output = output[0] if isinstance(output, tuple) else output
+                                    hf_component_inputs[(component_layer_idx, "self_attn")] = (
+                                        kwargs["hidden_states"].detach().cpu()
+                                    )
+                                    hf_component_outputs[
+                                        (component_layer_idx, "self_attn")
+                                    ] = component_output.detach().cpu()
+
+                                return _hook
+
+                            hf_layer_hooks.append(
+                                component.register_forward_hook(_capture_hf_attention(layer_idx), with_kwargs=True)
+                            )
+                        else:
+                            hf_layer_hooks.append(
+                                component.register_forward_hook(_capture_hf_component(layer_idx, component_name))
+                            )
         hf_layer_hooks.append(
             hf_text_model.norm.register_forward_hook(
                 lambda _module, _inputs, output: hf_final_norm_output.__setitem__("value", output.detach().cpu())
             )
         )
 
-    prompt = "The capital of France is"
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")  # [1, seq_len]
+    prompt = os.getenv("GEMMA4_TEST_PROMPT", "The capital of France is")
+    if os.getenv("GEMMA4_TEST_APPLY_CHAT_TEMPLATE") == "1":
+        input_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        if hasattr(input_ids, "keys"):
+            input_ids = input_ids["input_ids"]
+    else:
+        input_ids = tokenizer.encode(prompt, return_tensors="pt")  # [1, seq_len]
     seq_len = input_ids.shape[1]
-    padded_len = ((seq_len + 31) // 32) * 32
+    padded_len = int(os.getenv("GEMMA4_TEST_PADDED_LEN", ((seq_len + 31) // 32) * 32))
+    if padded_len < seq_len or padded_len % 32:
+        raise ValueError("GEMMA4_TEST_PADDED_LEN must be a multiple of 32 and cover the prompt")
     if padded_len > seq_len:
         input_ids_padded = F.pad(input_ids, (0, padded_len - seq_len), value=0)
     else:
@@ -407,16 +467,45 @@ def test_full_model(mesh_device, reset_seeds, request):
     # ── TT model ─────────────────────────────────────────────────────
     tp = mesh_device.shape[1] if hasattr(mesh_device, "shape") else 1
     logger.info(f"Creating TT model with all layers (TP={tp})...")
+    model_max_seq_len = int(os.getenv("GEMMA4_TEST_MAX_SEQ_LEN", max(padded_len, 128)))
+    if model_max_seq_len < padded_len:
+        raise ValueError("GEMMA4_TEST_MAX_SEQ_LEN must cover GEMMA4_TEST_PADDED_LEN")
+    use_paged_attention = os.getenv("GEMMA4_TEST_PAGED_ATTENTION") == "1"
+    paged_attention_config = None
+    page_table = None
+    if use_paged_attention:
+        from models.tt_transformers.tt.common import PagedAttentionConfig
+
+        page_block_size = int(os.getenv("GEMMA4_TEST_PAGE_BLOCK_SIZE", "64"))
+        if model_max_seq_len % page_block_size:
+            raise ValueError("GEMMA4_TEST_MAX_SEQ_LEN must be divisible by GEMMA4_TEST_PAGE_BLOCK_SIZE")
+        paged_attention_config = PagedAttentionConfig(
+            block_size=page_block_size,
+            max_num_blocks=model_max_seq_len // page_block_size,
+        )
+        page_table = torch.arange(paged_attention_config.max_num_blocks, dtype=torch.int32).reshape(
+            1, paged_attention_config.max_num_blocks
+        )
     model_args, tt_model, tt_kv_cache, state_dict = create_tt_model(
         mesh_device=mesh_device,
         max_batch_size=1,
-        max_seq_len=max(padded_len, 128),
+        max_seq_len=model_max_seq_len,
         model_path=model_path,
         create_kv_cache=True,
+        paged_attention_config=paged_attention_config,
     )
 
     is_mesh = hasattr(mesh_device, "shape") and mesh_device.get_num_devices() > 1
     replicate = ttnn.ReplicateTensorToMesh(mesh_device) if is_mesh else None
+    page_table_tt = None
+    if page_table is not None:
+        page_table_tt = ttnn.from_torch(
+            page_table,
+            device=mesh_device,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.int32,
+            mesh_mapper=replicate,
+        )
 
     tokens_tt = ttnn.from_torch(
         input_ids_padded.to(torch.int32),
@@ -444,7 +533,7 @@ def test_full_model(mesh_device, reset_seeds, request):
     def _prefill_once():
         return tt_model.ttnn_prefill_forward(
             embeds,
-            page_table=None,
+            page_table=page_table_tt,
             kv_cache=tt_kv_cache,
             input_ids_torch=input_ids_padded,
             embeds_torch=embeds_torch,
@@ -513,6 +602,173 @@ def test_full_model(mesh_device, reset_seeds, request):
             _, full_pcc = comp_pcc(hf_hidden, tt_hidden, pcc=0.0)
             _, last_pcc = comp_pcc(hf_hidden[-1], tt_hidden[-1], pcc=0.0)
             logger.info(f"Prefill layer[{layer_idx:02d}] PCC: full={full_pcc:.6f} last_token={last_pcc:.6f}")
+
+        def _from_hf_component(tensor):
+            return ttnn.from_torch(
+                tensor.unsqueeze(1),
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=replicate,
+            )
+
+        def _log_component_pcc(layer_idx, component_name, tt_output, hf_output):
+            width = hf_output.shape[-1]
+            tt_device = ttnn.get_device_tensors(tt_output)[0]
+            tt_torch = ttnn.to_torch(tt_device).reshape(-1, width)[:seq_len].float()
+            hf_torch = hf_output.reshape(-1, width)[:seq_len].float()
+            _, component_pcc = comp_pcc(hf_torch, tt_torch, pcc=0.0)
+            error = (hf_torch - tt_torch).abs()
+            logger.info(
+                f"Intrinsic prefill component layer[{layer_idx:02d}] {component_name}: "
+                f"pcc={component_pcc:.6f} mean_abs={error.mean().item():.6g} max_abs={error.max().item():.6g}"
+            )
+            tt_output.deallocate(True)
+
+        for layer_idx in sorted(component_layers):
+            if layer_idx in tt_model.kv_shared_layer_map:
+                raise ValueError(
+                    f"GEMMA4_COMPONENT_LAYERS currently supports non-KV-shared prefill layers only; got {layer_idx}"
+                )
+            layer = tt_model.layers[layer_idx]
+
+            input_norm_tt = layer.input_layernorm.forward(
+                _from_hf_component(hf_component_inputs[(layer_idx, "input_layernorm")])
+            )
+            _log_component_pcc(
+                layer_idx,
+                "input_norm",
+                input_norm_tt,
+                hf_component_outputs[(layer_idx, "input_layernorm")],
+            )
+
+            attention_tt = layer.self_attn(
+                _from_hf_component(hf_component_inputs[(layer_idx, "self_attn")]),
+                rope_mats=tt_model._get_rope_mats(layer_idx, seq_len=padded_len),
+                position_idx=None,
+                page_table=None,
+                kv_cache=tt_kv_cache[layer_idx],
+                is_decode=False,
+            )
+            _log_component_pcc(
+                layer_idx,
+                "attention",
+                attention_tt,
+                hf_component_outputs[(layer_idx, "self_attn")],
+            )
+
+            post_attention_norm_tt = layer.post_attention_layernorm.forward(
+                _from_hf_component(hf_component_inputs[(layer_idx, "post_attention_layernorm")])
+            )
+            _log_component_pcc(
+                layer_idx,
+                "post_attention_norm",
+                post_attention_norm_tt,
+                hf_component_outputs[(layer_idx, "post_attention_layernorm")],
+            )
+
+            attention_residual_tt = ttnn.add(
+                _from_hf_component(hf_layer_inputs[layer_idx]),
+                _from_hf_component(hf_component_outputs[(layer_idx, "post_attention_layernorm")]),
+            )
+            _log_component_pcc(
+                layer_idx,
+                "attention_residual_add",
+                attention_residual_tt,
+                hf_component_inputs[(layer_idx, "pre_feedforward_layernorm")],
+            )
+
+            pre_feedforward_norm_tt = layer.pre_feedforward_layernorm.forward(
+                _from_hf_component(hf_component_inputs[(layer_idx, "pre_feedforward_layernorm")])
+            )
+            _log_component_pcc(
+                layer_idx,
+                "pre_feedforward_norm",
+                pre_feedforward_norm_tt,
+                hf_component_outputs[(layer_idx, "pre_feedforward_layernorm")],
+            )
+
+            mlp_tt = layer.shared_mlp(_from_hf_component(hf_component_inputs[(layer_idx, "mlp")]))
+            _log_component_pcc(layer_idx, "mlp", mlp_tt, hf_component_outputs[(layer_idx, "mlp")])
+
+            post_feedforward_norm_tt = layer.post_feedforward_layernorm.forward(
+                _from_hf_component(hf_component_inputs[(layer_idx, "post_feedforward_layernorm")])
+            )
+            _log_component_pcc(
+                layer_idx,
+                "post_feedforward_norm",
+                post_feedforward_norm_tt,
+                hf_component_outputs[(layer_idx, "post_feedforward_layernorm")],
+            )
+
+            feedforward_residual_tt = ttnn.add(
+                _from_hf_component(hf_component_inputs[(layer_idx, "pre_feedforward_layernorm")]),
+                _from_hf_component(hf_component_outputs[(layer_idx, "post_feedforward_layernorm")]),
+            )
+            _log_component_pcc(
+                layer_idx,
+                "feedforward_residual_add",
+                feedforward_residual_tt,
+                hf_component_inputs[(layer_idx, "per_layer_input_gate")],
+            )
+
+            pli_gate_tt = ttnn.linear(
+                _from_hf_component(hf_component_inputs[(layer_idx, "per_layer_input_gate")]),
+                layer.per_layer_input_gate,
+            )
+            _log_component_pcc(
+                layer_idx,
+                "pli_gate_linear",
+                pli_gate_tt,
+                hf_component_outputs[(layer_idx, "per_layer_input_gate")],
+            )
+
+            pli_activated_tt = ttnn.gelu(
+                _from_hf_component(hf_component_outputs[(layer_idx, "per_layer_input_gate")]),
+                fast_and_approximate_mode=True,
+            )
+            pli_product_tt = ttnn.mul(pli_activated_tt, _from_hf_component(hf_pli_inputs[layer_idx]))
+            pli_activated_tt.deallocate(True)
+            _log_component_pcc(
+                layer_idx,
+                "pli_gelu_mul",
+                pli_product_tt,
+                hf_component_inputs[(layer_idx, "per_layer_projection")],
+            )
+
+            pli_projection_tt = ttnn.linear(
+                _from_hf_component(hf_component_inputs[(layer_idx, "per_layer_projection")]),
+                layer.per_layer_projection,
+            )
+            _log_component_pcc(
+                layer_idx,
+                "pli_projection_linear",
+                pli_projection_tt,
+                hf_component_outputs[(layer_idx, "per_layer_projection")],
+            )
+
+            post_pli_norm_tt = layer.post_per_layer_input_norm.forward(
+                _from_hf_component(hf_component_inputs[(layer_idx, "post_per_layer_input_norm")])
+            )
+            _log_component_pcc(
+                layer_idx,
+                "post_pli_norm",
+                post_pli_norm_tt,
+                hf_component_outputs[(layer_idx, "post_per_layer_input_norm")],
+            )
+
+            pli_residual_tt = ttnn.add(
+                _from_hf_component(hf_component_inputs[(layer_idx, "per_layer_input_gate")]),
+                _from_hf_component(hf_component_outputs[(layer_idx, "post_per_layer_input_norm")]),
+            )
+            if layer.layer_scalar != 1.0:
+                pli_residual_tt = ttnn.mul(pli_residual_tt, layer.layer_scalar)
+            _log_component_pcc(
+                layer_idx,
+                "pli_residual_add",
+                pli_residual_tt,
+                hf_layer_outputs[layer_idx],
+            )
 
         # Re-run every non-KV-shared layer with the exact HF layer input and
         # exact HF PLI tensor. This removes accumulated upstream drift and
@@ -642,14 +898,25 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
     hf_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True)
     hf_model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    log_layer_pcc = os.getenv("GEMMA4_LOG_LAYER_PCC") == "1"
+    component_layers = {
+        int(value) for value in os.getenv("GEMMA4_DECODE_COMPONENT_LAYERS", "").split(",") if value.strip()
+    }
+    use_hf_kv_cache = os.getenv("GEMMA4_USE_HF_KV_CACHE") == "1"
+    log_layer_pcc = os.getenv("GEMMA4_LOG_LAYER_PCC") == "1" or bool(component_layers) or use_hf_kv_cache
     hf_layer_outputs = {}
     hf_layer_inputs = {}
     hf_pli_inputs = {}
+    hf_component_inputs = {}
+    hf_component_outputs = {}
+    hf_kv_cache = {}
     hf_final_norm_output = {}
     hf_layer_hooks = []
+    hf_cache_layer_indices = set(component_layers)
     if log_layer_pcc:
         hf_text_model = hf_model.model.language_model if hasattr(hf_model.model, "language_model") else hf_model.model
+        num_kv_shared = int(getattr(hf_text_model.config, "num_kv_shared_layers", 0) or 0)
+        if use_hf_kv_cache:
+            hf_cache_layer_indices.update(range(len(hf_text_model.layers) - num_kv_shared))
 
         def _capture_hf_layer(layer_idx):
             def _hook(_module, inputs, output):
@@ -662,50 +929,163 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
 
         for layer_idx, layer in enumerate(hf_text_model.layers):
             hf_layer_hooks.append(layer.register_forward_hook(_capture_hf_layer(layer_idx)))
+            if layer_idx in component_layers:
+
+                def _capture_hf_component(component_layer_idx, component_name):
+                    def _hook(_module, inputs, output):
+                        if not inputs:
+                            return
+                        component_output = output[0] if isinstance(output, tuple) else output
+                        hf_component_inputs[(component_layer_idx, component_name)] = inputs[0].detach().cpu()
+                        hf_component_outputs[(component_layer_idx, component_name)] = component_output.detach().cpu()
+
+                    return _hook
+
+                for component_name in (
+                    "input_layernorm",
+                    "self_attn",
+                    "post_attention_layernorm",
+                    "pre_feedforward_layernorm",
+                    "mlp",
+                    "post_feedforward_layernorm",
+                    "per_layer_input_gate",
+                    "per_layer_projection",
+                    "post_per_layer_input_norm",
+                ):
+                    component = getattr(layer, component_name, None)
+                    if component is not None:
+                        if component_name == "self_attn":
+
+                            def _capture_hf_attention(component_layer_idx):
+                                def _hook(_module, _inputs, kwargs, output):
+                                    component_output = output[0] if isinstance(output, tuple) else output
+                                    hf_component_inputs[(component_layer_idx, "self_attn")] = (
+                                        kwargs["hidden_states"].detach().cpu()
+                                    )
+                                    hf_component_outputs[
+                                        (component_layer_idx, "self_attn")
+                                    ] = component_output.detach().cpu()
+
+                                return _hook
+
+                            hf_layer_hooks.append(
+                                component.register_forward_hook(_capture_hf_attention(layer_idx), with_kwargs=True)
+                            )
+                        else:
+                            hf_layer_hooks.append(
+                                component.register_forward_hook(_capture_hf_component(layer_idx, component_name))
+                            )
         hf_layer_hooks.append(
             hf_text_model.norm.register_forward_hook(
                 lambda _module, _inputs, output: hf_final_norm_output.__setitem__("value", output.detach().cpu())
             )
         )
 
-    prompt = "The capital of France is"
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    prompt = os.getenv("GEMMA4_TEST_PROMPT", "The capital of France is")
+    if os.getenv("GEMMA4_TEST_APPLY_CHAT_TEMPLATE") == "1":
+        input_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+        if hasattr(input_ids, "keys"):
+            input_ids = input_ids["input_ids"]
+    else:
+        input_ids = tokenizer.encode(prompt, return_tensors="pt")
     seq_len = input_ids.shape[1]
+    decode_steps = int(os.getenv("GEMMA4_TEST_DECODE_STEPS", "1"))
+    if decode_steps < 1:
+        raise ValueError("GEMMA4_TEST_DECODE_STEPS must be at least 1")
     with torch.no_grad():
         hf_out = hf_model(input_ids, use_cache=True)
         next_tok = int(hf_out.logits[0, -1].argmax().item())  # teacher-forced decode input
-        hf_dec = hf_model(torch.tensor([[next_tok]]), past_key_values=hf_out.past_key_values, use_cache=True)
-        hf_decode_logits = hf_dec.logits[0, -1].float()  # [vocab]
+        hf_past_key_values = hf_out.past_key_values
+        teacher_forced_tokens = []
+        for _decode_step in range(decode_steps):
+            teacher_forced_tokens.append(next_tok)
+            hf_dec = hf_model(
+                torch.tensor([[next_tok]]),
+                past_key_values=hf_past_key_values,
+                use_cache=True,
+            )
+            hf_decode_logits = hf_dec.logits[0, -1].float()  # [vocab]
+            hf_past_key_values = hf_dec.past_key_values
+            next_tok = int(hf_decode_logits.argmax().item())
+        for layer_idx in hf_cache_layer_indices:
+            cache_layer = hf_dec.past_key_values.layers[layer_idx]
+            hf_kv_cache[layer_idx] = (
+                cache_layer.keys.detach().cpu(),
+                cache_layer.values.detach().cpu(),
+            )
     for hook in hf_layer_hooks:
         hook.remove()
-    logger.info(f"HF prefill next token: {next_tok} ('{tokenizer.decode([next_tok])}'), decoding at pos={seq_len}")
+    decode_pos = seq_len + decode_steps - 1
+    decode_context_len = decode_pos + 1
+    logger.info(
+        f"HF teacher-forced tokens: {teacher_forced_tokens}; comparing decode step {decode_steps} "
+        f"at pos={decode_pos}, next token={next_tok} ('{tokenizer.decode([next_tok])}')"
+    )
     del hf_model
     gc.collect()
 
     # ── TT: prefill (fills KV), then the same teacher-forced decode step ──
-    padded_len = ((seq_len + 31) // 32) * 32
+    padded_len = int(os.getenv("GEMMA4_TEST_PADDED_LEN", ((seq_len + 31) // 32) * 32))
+    if padded_len < seq_len or padded_len % 32:
+        raise ValueError("GEMMA4_TEST_PADDED_LEN must be a multiple of 32 and cover the prompt")
     input_ids_padded = F.pad(input_ids, (0, padded_len - seq_len), value=0) if padded_len > seq_len else input_ids
 
+    model_max_seq_len = int(os.getenv("GEMMA4_TEST_MAX_SEQ_LEN", max(padded_len, 128)))
+    if model_max_seq_len < padded_len:
+        raise ValueError("GEMMA4_TEST_MAX_SEQ_LEN must cover GEMMA4_TEST_PADDED_LEN")
+    use_paged_attention = os.getenv("GEMMA4_TEST_PAGED_ATTENTION") == "1"
+    paged_attention_config = None
+    page_table = None
+    if use_paged_attention:
+        from models.tt_transformers.tt.common import PagedAttentionConfig
+
+        page_block_size = int(os.getenv("GEMMA4_TEST_PAGE_BLOCK_SIZE", "64"))
+        if model_max_seq_len % page_block_size:
+            raise ValueError("GEMMA4_TEST_MAX_SEQ_LEN must be divisible by GEMMA4_TEST_PAGE_BLOCK_SIZE")
+        paged_attention_config = PagedAttentionConfig(
+            block_size=page_block_size,
+            max_num_blocks=model_max_seq_len // page_block_size,
+        )
+        page_table = torch.arange(paged_attention_config.max_num_blocks, dtype=torch.int32).reshape(
+            1, paged_attention_config.max_num_blocks
+        )
     model_args, tt_model, tt_kv_cache, state_dict = create_tt_model(
         mesh_device=mesh_device,
         max_batch_size=1,
-        max_seq_len=max(padded_len, 128),
+        max_seq_len=model_max_seq_len,
         model_path=model_path,
         create_kv_cache=True,
+        paged_attention_config=paged_attention_config,
     )
     is_mesh = hasattr(mesh_device, "shape") and mesh_device.get_num_devices() > 1
     replicate = ttnn.ReplicateTensorToMesh(mesh_device) if is_mesh else None
+    page_table_tt = None
+    if page_table is not None:
+        page_table_tt = ttnn.from_torch(
+            page_table,
+            device=mesh_device,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.int32,
+            mesh_mapper=replicate,
+        )
 
-    tokens_tt = ttnn.from_torch(
-        input_ids_padded.to(torch.int32),
-        device=mesh_device,
-        layout=ttnn.ROW_MAJOR_LAYOUT,
-        dtype=ttnn.uint32,
-        mesh_mapper=replicate,
-    )
-    embeds = ttnn.to_layout(
-        ttnn.reshape(tt_model.embed_tokens(tokens_tt), (1, 1, padded_len, model_args.hidden_size)), ttnn.TILE_LAYOUT
-    )
+    def _build_prefill_embeds():
+        tokens_tt = ttnn.from_torch(
+            input_ids_padded.to(torch.int32),
+            device=mesh_device,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            dtype=ttnn.uint32,
+            mesh_mapper=replicate,
+        )
+        return ttnn.to_layout(
+            ttnn.reshape(tt_model.embed_tokens(tokens_tt), (1, 1, padded_len, model_args.hidden_size)),
+            ttnn.TILE_LAYOUT,
+        )
+
     embeds_torch = (
         F.embedding(
             input_ids_padded.long(),
@@ -716,16 +1096,66 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
         )
         * tt_model.embed_scale
     ).float()
-    tt_model.ttnn_prefill_forward(
-        embeds,
-        page_table=None,
-        kv_cache=tt_kv_cache,
-        input_ids_torch=input_ids_padded,
-        embeds_torch=embeds_torch,
-    ).deallocate(True)
+    prefill_repeats = int(os.getenv("GEMMA4_TEST_PREFILL_REPEATS", "1"))
+    if prefill_repeats < 1:
+        raise ValueError("GEMMA4_TEST_PREFILL_REPEATS must be at least 1")
+    get_last_token = int(os.getenv("GEMMA4_TEST_GET_LAST_TOKEN", "-1"))
+    for _prefill_repeat in range(prefill_repeats):
+        tt_model.ttnn_prefill_forward(
+            _build_prefill_embeds(),
+            page_table=page_table_tt,
+            kv_cache=tt_kv_cache,
+            get_last_token=get_last_token,
+            input_ids_torch=input_ids_padded,
+            embeds_torch=embeds_torch,
+        ).deallocate(True)
 
-    # One decode step at position seq_len with the teacher-forced token.
-    device_inputs = tt_model.prepare_inputs_decode(torch.tensor([next_tok]), torch.tensor([seq_len]), page_table=None)
+    decode_kv_cache = tt_kv_cache
+    if use_hf_kv_cache:
+        decode_kv_cache = []
+        for layer_idx, tt_layer_cache in enumerate(tt_kv_cache):
+            if layer_idx in tt_model.kv_shared_layer_map:
+                decode_kv_cache.append(decode_kv_cache[tt_model.kv_shared_layer_map[layer_idx]])
+                continue
+            seeded_layer_cache = []
+            for tt_cache, hf_cache in zip(tt_layer_cache, hf_kv_cache[layer_idx]):
+                cache_torch = torch.zeros(tuple(tt_cache.shape), dtype=torch.bfloat16)
+                cache_torch[:, :, : hf_cache.shape[2], :] = hf_cache
+                seeded_layer_cache.append(
+                    ttnn.from_torch(
+                        cache_torch,
+                        device=mesh_device,
+                        layout=ttnn.TILE_LAYOUT,
+                        dtype=ttnn.bfloat16,
+                        mesh_mapper=replicate,
+                    )
+                )
+            decode_kv_cache.append(seeded_layer_cache)
+        logger.info("Seeded all non-shared TT KV caches from the matched HF history")
+
+    # Replay the same HF-greedy tokens so the final comparison uses matched
+    # history even when an earlier free-running TT argmax would diverge.
+    replay_tokens = [] if use_hf_kv_cache else teacher_forced_tokens[:-1]
+    for decode_offset, teacher_token in enumerate(replay_tokens):
+        intermediate_inputs = tt_model.prepare_inputs_decode(
+            torch.tensor([teacher_token]),
+            torch.tensor([seq_len + decode_offset]),
+            page_table=page_table,
+        )
+        intermediate_logits, _ = tt_model.ttnn_decode_forward(
+            x=intermediate_inputs[0],
+            current_pos=intermediate_inputs[1],
+            rot_mat_idxs=intermediate_inputs[2],
+            page_table=intermediate_inputs[3],
+            kv_cache=decode_kv_cache,
+        )
+        intermediate_logits.deallocate(True)
+
+    device_inputs = tt_model.prepare_inputs_decode(
+        torch.tensor([teacher_forced_tokens[-1]]),
+        torch.tensor([decode_pos]),
+        page_table=page_table,
+    )
 
     def _decode_once():
         return tt_model.ttnn_decode_forward(
@@ -733,7 +1163,7 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
             current_pos=device_inputs[1],
             rot_mat_idxs=device_inputs[2],
             page_table=device_inputs[3],
-            kv_cache=tt_kv_cache,
+            kv_cache=decode_kv_cache,
         )
 
     tt_layer_outputs = {}
@@ -770,6 +1200,10 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
         f"Decode argmax: HF={hf_argmax} ('{tokenizer.decode([hf_argmax])}'), "
         f"TT={tt_argmax} ('{tokenizer.decode([tt_argmax])}')"
     )
+    hf_top_values, hf_top_indices = torch.topk(hf_decode_logits, k=5)
+    tt_top_values, tt_top_indices = torch.topk(tt_decode_logits, k=5)
+    logger.info("Decode HF top-5: " + repr(list(zip(hf_top_indices.tolist(), hf_top_values.tolist(), strict=True))))
+    logger.info("Decode TT top-5: " + repr(list(zip(tt_top_indices.tolist(), tt_top_values.tolist(), strict=True))))
     if log_layer_pcc:
         for layer_idx in range(len(tt_model.layers)):
             hf_hidden = hf_layer_outputs[layer_idx].reshape(-1, model_args.hidden_size)[-1]
@@ -787,6 +1221,234 @@ def test_full_model_decode(mesh_device, reset_seeds, request):
                 ttnn.unsqueeze_to_4D(ttnn.embedding(device_inputs[1], cos_2d, layout=ttnn.TILE_LAYOUT)),
                 ttnn.unsqueeze_to_4D(ttnn.embedding(device_inputs[1], sin_2d, layout=ttnn.TILE_LAYOUT)),
             )
+
+        for layer_idx in sorted(component_layers):
+            for cache_name, tt_cache, hf_cache in zip(
+                ("key_cache", "value_cache"),
+                tt_kv_cache[layer_idx],
+                hf_kv_cache[layer_idx],
+            ):
+                tt_cache_device = ttnn.get_device_tensors(tt_cache)[0]
+                tt_cache_torch = ttnn.to_torch(tt_cache_device)[:, :, :decode_context_len, :].float()
+                hf_cache_torch = hf_cache.float()
+                _, cache_pcc = compare_tensors(tt_cache_torch, hf_cache_torch, pcc_threshold=0.0)
+                cache_error = (hf_cache_torch - tt_cache_torch).abs()
+                logger.info(
+                    f"Decode layer[{layer_idx:02d}] {cache_name}: pcc={cache_pcc} "
+                    f"mean_abs={cache_error.mean().item():.6g} max_abs={cache_error.max().item():.6g}"
+                )
+                for position in range(decode_context_len):
+                    _, position_pcc = compare_tensors(
+                        tt_cache_torch[:, :, position, :],
+                        hf_cache_torch[:, :, position, :],
+                        pcc_threshold=0.0,
+                    )
+                    logger.info(f"Decode layer[{layer_idx:02d}] {cache_name} position[{position}]: pcc={position_pcc}")
+
+        def _from_hf_decode_component(tensor):
+            return ttnn.from_torch(
+                tensor.unsqueeze(1),
+                device=mesh_device,
+                layout=ttnn.TILE_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=replicate,
+            )
+
+        def _log_decode_component_pcc(layer_idx, component_name, tt_output, hf_output):
+            width = hf_output.shape[-1]
+            tt_device = ttnn.get_device_tensors(tt_output)[0]
+            tt_torch = ttnn.to_torch(tt_device).reshape(-1, width)[0].float()
+            hf_torch = hf_output.reshape(-1, width)[-1].float()
+            _, component_pcc = compare_tensors(tt_torch, hf_torch, pcc_threshold=0.0)
+            error = (hf_torch - tt_torch).abs()
+            logger.info(
+                f"Intrinsic decode component layer[{layer_idx:02d}] {component_name}: "
+                f"pcc={component_pcc} mean_abs={error.mean().item():.6g} max_abs={error.max().item():.6g}"
+            )
+            tt_output.deallocate(True)
+
+        for layer_idx in sorted(component_layers):
+            layer = tt_model.layers[layer_idx]
+
+            input_norm_tt = layer.input_layernorm.forward(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "input_layernorm")])
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "input_norm",
+                input_norm_tt,
+                hf_component_outputs[(layer_idx, "input_layernorm")],
+            )
+
+            attention_tt = layer.self_attn(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "self_attn")]),
+                rope_mats=decode_rope[layer.layer_type],
+                position_idx=device_inputs[1],
+                page_table=None,
+                kv_cache=tt_kv_cache[layer_idx],
+                is_decode=True,
+                token_index=None,
+                is_kv_shared=layer_idx in tt_model.kv_shared_layer_map,
+                position_idx_cache=device_inputs[2],
+                rope_presliced=True,
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "attention",
+                attention_tt,
+                hf_component_outputs[(layer_idx, "self_attn")],
+            )
+
+            hf_cache_tt = []
+            for tt_cache, hf_cache in zip(tt_kv_cache[layer_idx], hf_kv_cache[layer_idx]):
+                cache_torch = torch.zeros(tuple(tt_cache.shape), dtype=torch.bfloat16)
+                cache_torch[:, :, : hf_cache.shape[2], :] = hf_cache
+                hf_cache_tt.append(
+                    ttnn.from_torch(
+                        cache_torch,
+                        device=mesh_device,
+                        layout=ttnn.TILE_LAYOUT,
+                        dtype=ttnn.bfloat16,
+                        mesh_mapper=replicate,
+                    )
+                )
+            attention_hf_cache_tt = layer.self_attn(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "self_attn")]),
+                rope_mats=decode_rope[layer.layer_type],
+                position_idx=device_inputs[1],
+                page_table=None,
+                kv_cache=hf_cache_tt,
+                is_decode=True,
+                token_index=None,
+                is_kv_shared=True,
+                position_idx_cache=device_inputs[2],
+                rope_presliced=True,
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "attention_hf_kv_cache",
+                attention_hf_cache_tt,
+                hf_component_outputs[(layer_idx, "self_attn")],
+            )
+            for cache_tensor in hf_cache_tt:
+                cache_tensor.deallocate(True)
+
+            post_attention_norm_tt = layer.post_attention_layernorm.forward(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "post_attention_layernorm")])
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "post_attention_norm",
+                post_attention_norm_tt,
+                hf_component_outputs[(layer_idx, "post_attention_layernorm")],
+            )
+
+            attention_residual_tt = ttnn.add(
+                _from_hf_decode_component(hf_layer_inputs[layer_idx]),
+                _from_hf_decode_component(hf_component_outputs[(layer_idx, "post_attention_layernorm")]),
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "attention_residual_add",
+                attention_residual_tt,
+                hf_component_inputs[(layer_idx, "pre_feedforward_layernorm")],
+            )
+
+            pre_feedforward_norm_tt = layer.pre_feedforward_layernorm.forward(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "pre_feedforward_layernorm")])
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "pre_feedforward_norm",
+                pre_feedforward_norm_tt,
+                hf_component_outputs[(layer_idx, "pre_feedforward_layernorm")],
+            )
+
+            mlp_tt = layer.shared_mlp(_from_hf_decode_component(hf_component_inputs[(layer_idx, "mlp")]))
+            _log_decode_component_pcc(layer_idx, "mlp", mlp_tt, hf_component_outputs[(layer_idx, "mlp")])
+
+            post_feedforward_norm_tt = layer.post_feedforward_layernorm.forward(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "post_feedforward_layernorm")])
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "post_feedforward_norm",
+                post_feedforward_norm_tt,
+                hf_component_outputs[(layer_idx, "post_feedforward_layernorm")],
+            )
+
+            feedforward_residual_tt = ttnn.add(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "pre_feedforward_layernorm")]),
+                _from_hf_decode_component(hf_component_outputs[(layer_idx, "post_feedforward_layernorm")]),
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "feedforward_residual_add",
+                feedforward_residual_tt,
+                hf_component_inputs[(layer_idx, "per_layer_input_gate")],
+            )
+
+            pli_gate_tt = ttnn.linear(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "per_layer_input_gate")]),
+                layer.per_layer_input_gate,
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "pli_gate_linear",
+                pli_gate_tt,
+                hf_component_outputs[(layer_idx, "per_layer_input_gate")],
+            )
+
+            pli_activated_tt = ttnn.gelu(
+                _from_hf_decode_component(hf_component_outputs[(layer_idx, "per_layer_input_gate")]),
+                fast_and_approximate_mode=True,
+            )
+            pli_product_tt = ttnn.mul(
+                pli_activated_tt,
+                _from_hf_decode_component(hf_pli_inputs[layer_idx]),
+            )
+            pli_activated_tt.deallocate(True)
+            _log_decode_component_pcc(
+                layer_idx,
+                "pli_gelu_mul",
+                pli_product_tt,
+                hf_component_inputs[(layer_idx, "per_layer_projection")],
+            )
+
+            pli_projection_tt = ttnn.linear(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "per_layer_projection")]),
+                layer.per_layer_projection,
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "pli_projection_linear",
+                pli_projection_tt,
+                hf_component_outputs[(layer_idx, "per_layer_projection")],
+            )
+
+            post_pli_norm_tt = layer.post_per_layer_input_norm.forward(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "post_per_layer_input_norm")])
+            )
+            _log_decode_component_pcc(
+                layer_idx,
+                "post_pli_norm",
+                post_pli_norm_tt,
+                hf_component_outputs[(layer_idx, "post_per_layer_input_norm")],
+            )
+
+            pli_residual_tt = ttnn.add(
+                _from_hf_decode_component(hf_component_inputs[(layer_idx, "per_layer_input_gate")]),
+                _from_hf_decode_component(hf_component_outputs[(layer_idx, "post_per_layer_input_norm")]),
+            )
+            if layer.layer_scalar != 1.0:
+                pli_residual_tt = ttnn.mul(pli_residual_tt, layer.layer_scalar)
+            _log_decode_component_pcc(
+                layer_idx,
+                "pli_residual_add",
+                pli_residual_tt,
+                hf_layer_outputs[layer_idx],
+            )
+
         for layer_idx, layer in enumerate(tt_model.layers):
             input_tt = ttnn.from_torch(
                 hf_layer_inputs[layer_idx].unsqueeze(1),

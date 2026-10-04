@@ -14,6 +14,8 @@ HF weight shapes:
   down_proj.weight: [hidden_size, intermediate_size] = [2816, 2112]
 """
 
+import os
+
 import ttnn
 from models.demos.gemma4.tt.ccl import ccl_allreduce
 from models.demos.gemma4.utils.general_utils import get_cache_file_name
@@ -29,12 +31,33 @@ class SharedMLP:
         ccl_manager=None,
         dtype=ttnn.bfloat8_b,
         tensor_cache_path=None,
+        layer_idx=None,
     ):
         self.mesh_device = mesh_device
         self.mesh_config = mesh_config
         self.ccl_manager = ccl_manager
         self.hidden_size = hf_config.hidden_size
         self.intermediate_size = hf_config.intermediate_size
+        self.layer_idx = layer_idx
+        fp32_acc_layers = {
+            int(value) for value in os.getenv("GEMMA4_MLP_FP32_ACC_LAYERS", "").split(",") if value.strip()
+        }
+        exact_gelu_layers = {
+            int(value) for value in os.getenv("GEMMA4_MLP_EXACT_GELU_LAYERS", "").split(",") if value.strip()
+        }
+        self.fast_gelu = layer_idx not in exact_gelu_layers
+        self.compute_kernel_config = None
+        if layer_idx in fp32_acc_layers:
+            self.compute_kernel_config = ttnn.init_device_compute_kernel_config(
+                mesh_device.arch(),
+                math_fidelity=getattr(
+                    ttnn.MathFidelity,
+                    os.getenv("GEMMA4_PRECISION_MATH_FIDELITY", "HiFi3"),
+                ),
+                math_approx_mode=False,
+                fp32_dest_acc_en=os.getenv("GEMMA4_PRECISION_FP32_DEST_ACC", "1") == "1",
+                packer_l1_acc=False,
+            )
 
         tp = mesh_config.tp if mesh_config else 1
         tp_suffix = f"_tp{tp}" if tp > 1 else ""
@@ -100,11 +123,11 @@ class SharedMLP:
         gate/up are column-parallel, down is row-parallel + allreduce.
         """
         # gate = GELU(x @ gate_proj)
-        gate = ttnn.linear(hidden_states, self.gate_proj)
-        gate = ttnn.gelu(gate, fast_and_approximate_mode=True)
+        gate = ttnn.linear(hidden_states, self.gate_proj, compute_kernel_config=self.compute_kernel_config)
+        gate = ttnn.gelu(gate, fast_and_approximate_mode=self.fast_gelu)
 
         # up = x @ up_proj
-        up = ttnn.linear(hidden_states, self.up_proj)
+        up = ttnn.linear(hidden_states, self.up_proj, compute_kernel_config=self.compute_kernel_config)
 
         # hidden = gate * up
         hidden = ttnn.mul(gate, up)
@@ -112,7 +135,7 @@ class SharedMLP:
         up.deallocate(True)
 
         # output = hidden @ down_proj
-        output = ttnn.linear(hidden, self.down_proj)
+        output = ttnn.linear(hidden, self.down_proj, compute_kernel_config=self.compute_kernel_config)
         hidden.deallocate(True)
 
         # Allreduce after row-parallel down_proj

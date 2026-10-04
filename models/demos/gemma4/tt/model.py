@@ -15,6 +15,7 @@ Supports both prefill and decode modes with paged attention.
 Compatible with tt_transformers Generator interface.
 """
 
+import os
 
 import torch
 from loguru import logger
@@ -996,7 +997,24 @@ class Gemma4Model:
                 k=self.hidden_size,
                 n=self.lm_head_weight.shape[-1],
             )
-            logits = ttnn.linear(hidden_states, self.lm_head_weight, program_config=lm_head_pc)
+            lm_head_compute_kernel_config = None
+            if os.getenv("GEMMA4_LM_HEAD_FP32_ACC") == "1":
+                lm_head_compute_kernel_config = ttnn.init_device_compute_kernel_config(
+                    self.mesh_device.arch(),
+                    math_fidelity=getattr(
+                        ttnn.MathFidelity,
+                        os.getenv("GEMMA4_PRECISION_MATH_FIDELITY", "HiFi3"),
+                    ),
+                    math_approx_mode=False,
+                    fp32_dest_acc_en=os.getenv("GEMMA4_PRECISION_FP32_DEST_ACC", "1") == "1",
+                    packer_l1_acc=False,
+                )
+            logits = ttnn.linear(
+                hidden_states,
+                self.lm_head_weight,
+                program_config=lm_head_pc,
+                compute_kernel_config=lm_head_compute_kernel_config,
+            )
             hidden_states.deallocate(True)
         else:
             logits = hidden_states

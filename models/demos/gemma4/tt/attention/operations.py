@@ -40,13 +40,46 @@ PREFILL_CHUNK_SIZE = int(os.environ.get("GEMMA4_PREFILL_CHUNK_SIZE", "8192"))
 PREFILL_SLIDING_CHUNK_SIZE = int(os.environ.get("GEMMA4_PREFILL_SLIDING_CHUNK_SIZE", "30720"))
 
 
-def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config=None):
+def get_projection_compute_kernel_configs(mesh_device, config):
+    all_projection_layers = {
+        int(value) for value in os.getenv("GEMMA4_ATTN_PROJ_FP32_ACC_LAYERS", "").split(",") if value.strip()
+    }
+    qkv_layers = all_projection_layers | {
+        int(value) for value in os.getenv("GEMMA4_ATTN_QKV_FP32_ACC_LAYERS", "").split(",") if value.strip()
+    }
+    output_layers = all_projection_layers | {
+        int(value) for value in os.getenv("GEMMA4_ATTN_OUT_FP32_ACC_LAYERS", "").split(",") if value.strip()
+    }
+
+    def _config(enabled):
+        if not enabled:
+            return None
+        return ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=getattr(
+                ttnn.MathFidelity,
+                os.getenv("GEMMA4_PRECISION_MATH_FIDELITY", "HiFi3"),
+            ),
+            math_approx_mode=False,
+            fp32_dest_acc_en=os.getenv("GEMMA4_PRECISION_FP32_DEST_ACC", "1") == "1",
+            packer_l1_acc=False,
+        )
+
+    return _config(config.layer_idx in qkv_layers), _config(config.layer_idx in output_layers)
+
+
+def apply_qkv_projection(hidden_states, weights: AttentionWeights, memory_config=None, compute_kernel_config=None):
     """Fused QKV matmul (no bias for Gemma4).
 
     ``memory_config`` lets the packed-verify decode keep the projection output
     resident on L1; ``None`` keeps the op default (DRAM) for existing callers.
     """
-    return ttnn.linear(hidden_states, weights.wqkv, memory_config=memory_config)
+    return ttnn.linear(
+        hidden_states,
+        weights.wqkv,
+        memory_config=memory_config,
+        compute_kernel_config=compute_kernel_config,
+    )
 
 
 def split_qkv_heads_decode(xqkv_fused, config, is_global: bool, tp: int = 1, kv_replicated: bool = False):
@@ -479,9 +512,9 @@ def concat_heads(tensor, is_decode_mode: bool, num_heads: int = None, head_dim: 
     return ttnn.experimental.nlp_concat_heads(tensor, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
 
-def apply_output_projection(tensor, weights: AttentionWeights):
+def apply_output_projection(tensor, weights: AttentionWeights, compute_kernel_config=None):
     """Apply output projection (no bias for Gemma4)."""
-    out = ttnn.linear(tensor, weights.o_proj)
+    out = ttnn.linear(tensor, weights.o_proj, compute_kernel_config=compute_kernel_config)
     tensor.deallocate(True)
     return out
 

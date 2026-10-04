@@ -24,6 +24,7 @@ from .operations import (
     chunked_prefill_sdpa_sliding,
     concat_heads,
     effective_block_size,
+    get_projection_compute_kernel_configs,
     prefill_sdpa_program_config,
     split_qkv_heads_prefill,
 )
@@ -79,6 +80,7 @@ def _prefill_forward_single(
     kv_cache,
     config,
     mesh_config,
+    mesh_device,
     page_table=None,
     user_id=0,
     ccl_manager=None,
@@ -105,6 +107,7 @@ def _prefill_forward_single(
     Returns ``(tt_out, kept_kv, sliding_tail_out)``.
     """
     tp = mesh_config.tp if mesh_config else 1
+    qkv_compute_kernel_config, output_compute_kernel_config = get_projection_compute_kernel_configs(mesh_device, config)
     is_chunked = chunk_page_table is not None
     chunk_offset = int(chunk_start_idx) if chunk_start_idx is not None else 0
     need_cross_chunk = is_chunked and chunk_offset > 0
@@ -128,7 +131,11 @@ def _prefill_forward_single(
     else:
         fill_page_table = chunk_page_table if is_chunked else page_table
 
-    xqkv = apply_qkv_projection(hidden_states, weights)
+    xqkv = apply_qkv_projection(
+        hidden_states,
+        weights,
+        compute_kernel_config=qkv_compute_kernel_config,
+    )
 
     tt_q, tt_k, tt_v = split_qkv_heads_prefill(
         xqkv, config, weights.is_global, tp=tp, kv_replicated=weights.kv_replicated
@@ -366,7 +373,7 @@ def _prefill_forward_single(
         kept_kv = (tt_k, tt_v)
 
     tt_out = concat_heads(tt_sdpa, is_decode_mode=False)
-    tt_out = apply_output_projection(tt_out, weights)
+    tt_out = apply_output_projection(tt_out, weights, compute_kernel_config=output_compute_kernel_config)
     tt_out = apply_allreduce(tt_out, mesh_config, ccl_manager, config.hidden_size)
 
     return tt_out, kept_kv, sliding_tail_out
@@ -420,6 +427,7 @@ def prefill_forward(
             kv_cache,
             config,
             mesh_config,
+            mesh_device,
             page_table=page_table,
             user_id=user_id,
             ccl_manager=ccl_manager,
@@ -432,6 +440,7 @@ def prefill_forward(
         )
 
     tp = mesh_config.tp if mesh_config else 1
+    qkv_compute_kernel_config, output_compute_kernel_config = get_projection_compute_kernel_configs(mesh_device, config)
     hidden_states = ttnn.reshape(
         hidden_states, [1, 1, hidden_states.shape[-2] * hidden_states.shape[-3] * hidden_states.shape[0], -1]
     )
@@ -439,7 +448,11 @@ def prefill_forward(
     seq_len = hidden_states.shape[-2]
     original_seq_len = seq_len
 
-    xqkv = apply_qkv_projection(hidden_states, weights)
+    xqkv = apply_qkv_projection(
+        hidden_states,
+        weights,
+        compute_kernel_config=qkv_compute_kernel_config,
+    )
     ttnn.deallocate(hidden_states)
 
     xqkv = ttnn.reshape(xqkv, [batch_size, 1, seq_len // batch_size, -1])
@@ -536,7 +549,7 @@ def prefill_forward(
         kept_kv = (tt_k, tt_v)
 
     tt_out = concat_heads(tt_sdpa, is_decode_mode=False)
-    tt_out = apply_output_projection(tt_out, weights)
+    tt_out = apply_output_projection(tt_out, weights, compute_kernel_config=output_compute_kernel_config)
     tt_out = apply_allreduce(tt_out, mesh_config, ccl_manager, config.hidden_size)
 
     tt_out = ttnn.reshape(tt_out, [1, 1, original_seq_len, -1])

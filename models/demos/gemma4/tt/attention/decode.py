@@ -20,6 +20,7 @@ from .operations import (
     apply_rope_decode_peruser,
     concat_heads,
     effective_block_size,
+    get_projection_compute_kernel_configs,
     split_qkv_heads_decode,
     split_qkv_heads_prefill,
 )
@@ -92,9 +93,14 @@ def decode_forward(
         is_kv_shared: if True, skip K/V projection and cache update (use source layer's KV cache)
     """
     tp = mesh_config.tp if mesh_config else 1
+    qkv_compute_kernel_config, output_compute_kernel_config = get_projection_compute_kernel_configs(mesh_device, config)
 
     # 1. Fused QKV projection
-    xqkv = apply_qkv_projection(hidden_states, weights)
+    xqkv = apply_qkv_projection(
+        hidden_states,
+        weights,
+        compute_kernel_config=qkv_compute_kernel_config,
+    )
 
     # 2. Split into Q, K, V heads
     tt_q, tt_k, tt_v = split_qkv_heads_decode(
@@ -297,6 +303,18 @@ def decode_forward(
         k_chunk_size=64,
         exp_approx_mode=False,
     )
+    sdpa_fp32_acc_layers = {
+        int(value) for value in os.getenv("GEMMA4_ATTN_SDPA_FP32_ACC_LAYERS", "").split(",") if value.strip()
+    }
+    sdpa_compute_kernel_config = None
+    if config.layer_idx in sdpa_fp32_acc_layers:
+        sdpa_compute_kernel_config = ttnn.init_device_compute_kernel_config(
+            mesh_device.arch(),
+            math_fidelity=ttnn.MathFidelity.HiFi3,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
 
     if page_table is not None:
         sdpa_num_local_kv_heads = 1 if weights.kv_replicated else config.num_key_value_heads // tp
@@ -310,6 +328,7 @@ def decode_forward(
             sliding_window_size=sliding_window,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=sdpa_program_config,
+            compute_kernel_config=sdpa_compute_kernel_config,
             # Tell SDPA the layer's view of the cache when the buffer was allocated
             # for a different layer type under HMA cross-group sharing — same
             # rationale as the num_kv_heads override on paged_update_cache.
@@ -329,6 +348,7 @@ def decode_forward(
             sliding_window_size=sliding_window,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=sdpa_program_config,
+            compute_kernel_config=sdpa_compute_kernel_config,
         )
     tt_q.deallocate(True)
 
@@ -337,7 +357,7 @@ def decode_forward(
     tt_out = concat_heads(
         tt_sdpa, is_decode_mode=True, num_heads=num_local_heads, head_dim=config.head_dim, mesh_device=mesh_device
     )
-    tt_out = apply_output_projection(tt_out, weights)
+    tt_out = apply_output_projection(tt_out, weights, compute_kernel_config=output_compute_kernel_config)
     tt_out = apply_allreduce(tt_out, mesh_config, ccl_manager, config.hidden_size)
 
     return tt_out

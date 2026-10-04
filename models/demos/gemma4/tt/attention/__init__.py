@@ -25,6 +25,7 @@ class Gemma4AttentionConfig:
     """Configuration for a single attention layer, derived from HF config + layer type."""
 
     def __init__(self, hf_config, layer_idx):
+        self.layer_idx = layer_idx
         self.layer_type = hf_config.layer_types[layer_idx]
         self.hidden_size = hf_config.hidden_size
         self.num_attention_heads = hf_config.num_attention_heads
